@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# ROS2 build artifacts
+build/
+install/
+log/
+
+# Editor
+.vscode/

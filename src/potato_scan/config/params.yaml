@@ -1,0 +1,108 @@
+# Step 1 (run first): ros2 run potato_scan handeye_calibration
+# Freedrive the arm, capture 10-15+ views of a fixed checkerboard, then
+# copy the printed tcp_cam_translation / tcp_cam_quat_xyzw below into the
+# scan_controller block -- everything downstream depends on this.
+handeye_calibration:
+  ros__parameters:
+    robot_ip: "192.168.1.100"
+    image_topic: "/camera/color/image_raw"
+    camera_info_topic: "/camera/color/camera_info"
+    chessboard_cols: 9   # inner corners, width
+    chessboard_rows: 6   # inner corners, height
+    square_size_m: 0.025
+    output_path: "handeye_result.yaml"
+
+scan_controller:
+  ros__parameters:
+    robot_ip: "192.168.1.100"
+    # 'rtde' = real UR5e / URSim over RTDE (default, unchanged real-hardware
+    # behavior). 'isaac_sim' = talk to isaac/isaac_scene.py over ROS2 topics
+    # + TF instead -- run that script separately first, then launch with
+    # robot_backend:=isaac_sim.
+    robot_backend: "rtde"
+    tcp_frame: "tool0"   # only used by isaac_sim backend (TF lookup)
+    base_frame: "base_link"
+    # Fixed potato location in the robot base frame (meters). Measure this
+    # once for your fixture, or replace with a coarse detection later.
+    potato_center: [0.50, 0.00, 0.15]
+    # No per-potato size measurement needed here: these are generic bounds
+    # loose enough to admit any real potato this fixture could hold (and
+    # reject the table/fixture/gripper, which sit well outside the band).
+    # The actual radius of whichever potato is currently mounted is
+    # estimated live from the scan itself (median radius of plausible
+    # points -- see surface_coverage.SurfaceCoverageGrid), logged each
+    # step as estimated_potato_radius. radius_band is how far a point may
+    # sit from that live estimate and still count as "on the surface" --
+    # generous enough for a potato's natural lumpiness/elongation.
+    min_expected_radius: 0.015   # smaller than the smallest potato you'd ever load
+    max_expected_radius: 0.07    # larger than the largest potato you'd ever load
+    radius_band: 0.02
+    scan_radius: 0.15
+    # Live coverage grid resolution (degrees per cell) around the potato.
+    # Coverage is judged from real accumulated points landing in each
+    # cell (surface_coverage.SurfaceCoverageGrid), not from a preset
+    # candidate list -- this is what lets differently-shaped potatoes
+    # each get scanned according to their own actual gaps.
+    elevation_bin_deg: 8.0
+    azimuth_bin_deg: 8.0
+    min_hits_to_fill: 3
+    min_elevation_deg: -15.0
+    max_elevation_deg: 85.0
+    coverage_threshold: 0.95
+    max_views: 60
+    settle_time_s: 1.5
+    # When a targeted grid cell is still empty after its nominal view,
+    # retry that exact spot this many times with an independent recovery
+    # motion (closer/farther radius, tilted angle -- see
+    # surface_coverage.RECOVERY_OFFSETS) before giving up and flagging it
+    # unscannable. Capped at len(RECOVERY_OFFSETS)=6.
+    max_local_retries: 4
+    # Hand-eye calibration result: camera pose expressed in the TCP frame.
+    # REPLACE these placeholders with your calibrateHandEye()/easy_handeye output.
+    tcp_cam_translation: [0.0, -0.05, 0.05]
+    tcp_cam_quat_xyzw: [0.0, 0.0, 0.0, 1.0]
+
+pointcloud_accumulator:
+  ros__parameters:
+    camera_topic: "/camera/depth/color/points"
+    base_frame: "base_link"
+    voxel_size: 0.001
+
+eye_detector:
+  ros__parameters:
+    base_frame: "base_link"
+    knn: 30
+    concavity_threshold: 0.0015  # meters; tune against a real scan before trusting it
+    cluster_eps: 0.003
+    cluster_min_points: 8
+    min_eye_diameter: 0.002
+    max_eye_diameter: 0.015
+
+drill_controller:
+  ros__parameters:
+    robot_ip: "192.168.1.100"
+    robot_backend: "rtde"     # 'rtde' or 'isaac_sim' -- see scan_controller above
+    base_frame: "base_link"
+    tcp_frame: "tool0"        # only used by isaac_sim backend
+    drill_output_pin: 0       # UR5e tool digital output driving the drill relay
+    standoff: 0.03            # approach distance above the eye, meters
+    max_depth: 0.015          # SAFETY LIMIT -- tune per potato/drill bit before running
+    feed_force: 15.0          # newtons, force-mode feed pressure into the surface
+    max_force: 40.0           # SAFETY LIMIT -- abort insertion above this force
+    approach_speed: 0.2
+    approach_acceleration: 0.5
+    drill_timeout_s: 8.0
+
+# Step 3 (run before trusting drill_controller): ros2 run potato_scan
+# force_drill_tuner. Freedrive to a single real probe point and iterate
+# on feed_force/max_force/max_depth here in isolation -- start low, watch
+# the reported depth/force, then raise. Copy tuned values into
+# drill_controller above once confident.
+force_drill_tuner:
+  ros__parameters:
+    robot_ip: "192.168.1.100"
+    drill_output_pin: 0
+    feed_force: 8.0     # start LOW, well under drill_controller's value above
+    max_force: 25.0
+    max_depth: 0.015
+    drill_timeout_s: 8.0
