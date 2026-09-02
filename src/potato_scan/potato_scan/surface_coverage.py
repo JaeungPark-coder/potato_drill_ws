@@ -99,6 +99,19 @@ class SurfaceCoverageGrid:
         azimuth_deg = (a + 0.5) * self.azimuth_bin_deg
         return spherical_to_direction(elevation_deg, azimuth_deg)
 
+    def direction_to_cell(self, direction):
+        """Inverse of cell_direction -- which (e, a) cell a given direction
+        falls into. Lets a continuous direction (e.g. from an RL view
+        policy) reuse the same is_filled/mark_unscannable bookkeeping the
+        heuristic's grid-cell-indexed next_gap_direction relies on."""
+        elevation_deg, azimuth_deg = direction_to_spherical(direction)
+        elevation_deg = np.clip(elevation_deg, self.min_elevation_deg,
+                                 self.max_elevation_deg - 1e-9)
+        e = int((elevation_deg - self.min_elevation_deg) / self.elevation_bin_deg)
+        a = int(azimuth_deg / self.azimuth_bin_deg) % self.n_az
+        e = min(max(e, 0), self.n_elev - 1)
+        return e, a
+
     def set_from_points(self, points, potato_center):
         """Recompute hit counts (and the live radius estimate) from the
         current full merged cloud. Called each time a new

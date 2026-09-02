@@ -6,5 +6,9 @@ build/
 install/
 log/
 
+# RL training artifacts (trained policy checkpoints, tensorboard logs)
+models/
+rl_logs/
+
 # Editor
 .vscode/

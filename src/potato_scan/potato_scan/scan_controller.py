@@ -9,7 +9,11 @@ adapt automatically to whatever shape the current potato has: an odd
 lump or a deep eye pocket that occludes itself from some angles shows up
 directly as an empty cell in the real reconstruction, not as a guess.
 
-Loop:
+Loop (step 1 below is the `view_policy: 'heuristic'` default; set
+`view_policy: 'rl'` + `rl_model_path` to instead have a trained policy --
+see potato_scan/rl/scan_policy_backend.py and isaac/train_scan_policy.py --
+choose the next view, still using the same grid/recovery bookkeeping for
+steps 2-5):
   1. pick the nearest not-yet-filled, not-yet-given-up grid cell
      (minimizes robot travel between views)
   2. compute a camera pose looking at the potato center from that cell's
@@ -82,6 +86,14 @@ class ScanController(Node):
         # hand-eye calibration result (camera pose in TCP frame) -- REPLACE with your calibration.
         self.declare_parameter('tcp_cam_translation', [0.0, -0.05, 0.05])
         self.declare_parameter('tcp_cam_quat_xyzw', [0.0, 0.0, 0.0, 1.0])
+        # 'heuristic' (default) = SurfaceCoverageGrid.next_gap_direction picks
+        # the nearest uncovered cell. 'rl' = a trained policy (see
+        # potato_scan/rl/ and isaac/train_scan_policy.py) picks the next view
+        # instead -- requires rl_model_path and an Isaac Sim bring-up
+        # (robot_backend:=isaac_sim), since that's what the policy was
+        # trained against.
+        self.declare_parameter('view_policy', 'heuristic')
+        self.declare_parameter('rl_model_path', '')
 
         self.base_frame = self.get_parameter('base_frame').value
         self.potato_center = np.array(self.get_parameter('potato_center').value)
@@ -105,6 +117,17 @@ class ScanController(Node):
             max_elevation_deg=self.get_parameter('max_elevation_deg').value,
             min_hits_to_fill=self.get_parameter('min_hits_to_fill').value,
         )
+
+        view_policy_mode = self.get_parameter('view_policy').value
+        if view_policy_mode == 'rl':
+            from potato_scan.rl.scan_policy_backend import RLViewPolicy
+            self.view_policy = RLViewPolicy(
+                self.get_parameter('rl_model_path').value,
+                self.coverage.min_elevation_deg, self.coverage.max_elevation_deg)
+            self.get_logger().info(
+                f"view_policy=rl, loaded {self.get_parameter('rl_model_path').value}")
+        else:
+            self.view_policy = None
 
         self.create_subscription(PointCloud2, '/potato_scan/merged_cloud', self._on_cloud, 10)
 
@@ -167,14 +190,16 @@ class ScanController(Node):
         self._views_taken += 1
         time.sleep(self.settle_time_s)
 
-    def _scan_with_recovery(self, e, a, direction):
-        """Attempt the nominal view; if the targeted cell is still empty
-        in the real reconstruction afterwards, retry that exact spot with
+    def _scan_with_recovery(self, e, a, direction, radius_scale=1.0):
+        """Attempt the nominal view (at self.scan_radius * radius_scale --
+        radius_scale is 1.0 for the heuristic, policy-chosen when
+        view_policy == 'rl'); if the targeted cell is still empty in the
+        real reconstruction afterwards, retry that exact spot with
         independent recovery motions (closer/farther radius, tilted
         angle) before giving up on it. Returns True if any attempt
         (nominal or recovery) filled the cell."""
         self.get_logger().info(f'moving to cell ({e},{a}) direction={np.round(direction, 2)}')
-        self._attempt_view(direction, self.scan_radius)
+        self._attempt_view(direction, self.scan_radius * radius_scale)
         if self.coverage.is_filled(e, a):
             return True
 
@@ -182,9 +207,9 @@ class ScanController(Node):
             f'cell ({e},{a}) still empty after nominal view -- retrying with '
             f'independent recovery motions')
 
-        for attempt, (perturbed_dir, radius_scale) in enumerate(
+        for attempt, (perturbed_dir, recovery_radius_scale) in enumerate(
                 self.coverage.recovery_attempts(direction, self.max_local_retries), start=1):
-            radius = self.scan_radius * radius_scale
+            radius = self.scan_radius * recovery_radius_scale
             self.get_logger().info(
                 f'cell ({e},{a}) recovery attempt {attempt}/{self.max_local_retries}: '
                 f'direction={np.round(perturbed_dir, 2)} radius={radius:.3f}')
@@ -216,12 +241,18 @@ class ScanController(Node):
             self._finish()
             return
 
-        e, a, direction = self.coverage.next_gap_direction(self._last_direction)
-        if e is None:
-            self._finish()
-            return
+        if self.view_policy is not None:
+            direction, radius_scale = self.view_policy.next_view(
+                self.coverage, self._last_direction, self._views_taken, self.max_views)
+            e, a = self.coverage.direction_to_cell(direction)
+        else:
+            e, a, direction = self.coverage.next_gap_direction(self._last_direction)
+            if e is None:
+                self._finish()
+                return
+            radius_scale = 1.0
 
-        ok = self._scan_with_recovery(e, a, direction)
+        ok = self._scan_with_recovery(e, a, direction, radius_scale)
         if not ok:
             self.coverage.mark_unscannable(e, a)
         self._last_direction = direction

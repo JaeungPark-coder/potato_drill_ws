@@ -66,12 +66,27 @@ class DrillController(Node):
         self.declare_parameter('approach_speed', 0.2)
         self.declare_parameter('approach_acceleration', 0.5)
         self.declare_parameter('drill_timeout_s', 8.0)
+        # 'heuristic' (default) = sweep ROLL_SEARCH_DEG until one orientation
+        # is reachable. 'rl' = a trained policy (see potato_scan/rl/ and
+        # isaac/train_drill_policy.py) picks the approach roll + a small
+        # lateral offset instead -- requires rl_model_path.
+        self.declare_parameter('approach_policy', 'heuristic')
+        self.declare_parameter('rl_model_path', '')
 
         self.standoff = self.get_parameter('standoff').value
         self.max_depth = self.get_parameter('max_depth').value
         self.feed_force = self.get_parameter('feed_force').value
         self.max_force = self.get_parameter('max_force').value
         self.drill_timeout_s = self.get_parameter('drill_timeout_s').value
+
+        approach_policy_mode = self.get_parameter('approach_policy').value
+        if approach_policy_mode == 'rl':
+            from potato_scan.rl.drill_policy_backend import RLApproachPolicy
+            self.approach_policy = RLApproachPolicy(self.get_parameter('rl_model_path').value)
+            self.get_logger().info(
+                f"approach_policy=rl, loaded {self.get_parameter('rl_model_path').value}")
+        else:
+            self.approach_policy = None
 
         backend = self.get_parameter('robot_backend').value
         if backend == 'isaac_sim':
@@ -113,7 +128,11 @@ class DrillController(Node):
         (rotationally symmetric) drill axis until one is actually
         reachable. Returns (approach_position, rotvec) of the pose the
         robot successfully moved to, or (None, None) if every roll offset
-        was rejected."""
+        was rejected. When approach_policy == 'rl', delegates to the
+        trained policy instead (see potato_scan/rl/drill_policy_backend.py)."""
+        if self.approach_policy is not None:
+            return self.approach_policy.find_approach(self.robot, position, normal, self.standoff)
+
         approach = approach_pose(position, normal, self.standoff)
         base_rotation = normal_rotation(normal)
         for roll_deg in ROLL_SEARCH_DEG:

@@ -61,6 +61,9 @@ scan_controller:
     # REPLACE these placeholders with your calibrateHandEye()/easy_handeye output.
     tcp_cam_translation: [0.0, -0.05, 0.05]
     tcp_cam_quat_xyzw: [0.0, 0.0, 0.0, 1.0]
+    # 'heuristic' (default) or 'rl' -- see Step 4 below.
+    view_policy: "heuristic"
+    rl_model_path: ""
 
 pointcloud_accumulator:
   ros__parameters:
@@ -92,6 +95,9 @@ drill_controller:
     approach_speed: 0.2
     approach_acceleration: 0.5
     drill_timeout_s: 8.0
+    # 'heuristic' (default) or 'rl' -- see Step 4 below.
+    approach_policy: "heuristic"
+    rl_model_path: ""
 
 # Step 3 (run before trusting drill_controller): ros2 run potato_scan
 # force_drill_tuner. Freedrive to a single real probe point and iterate
@@ -106,3 +112,21 @@ force_drill_tuner:
     max_force: 25.0
     max_depth: 0.015
     drill_timeout_s: 8.0
+
+# Step 4 (optional, needs Isaac Sim): train RL policies that replace the
+# next-gap-cell scan heuristic and the roll-search drill-approach heuristic
+# with a learned policy. Training runs inside Isaac Sim's own physics (real
+# robot moves, real contact force), so it's slow -- a solid first draft to
+# iterate on, not a guaranteed-converged recipe. See
+# src/potato_scan/potato_scan/rl/ for the shared observation/action/reward
+# code and src/potato_scan/isaac/train_scan_policy.py /
+# train_drill_policy.py for the training scripts themselves.
+#
+#   1. colcon build --symlink-install && source install/setup.bash
+#   2. <isaac-sim-install-dir>/python.sh -m pip install stable-baselines3 gymnasium
+#   3. <isaac-sim-install-dir>/python.sh src/potato_scan/isaac/train_scan_policy.py
+#      <isaac-sim-install-dir>/python.sh src/potato_scan/isaac/train_drill_policy.py
+#   4. set scan_controller.view_policy / drill_controller.approach_policy to
+#      "rl" above, and rl_model_path to the saved model (e.g.
+#      models/scan_policy_final.zip), then launch with
+#      robot_backend:=isaac_sim as usual.
