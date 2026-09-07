@@ -37,6 +37,41 @@ def estimate_concavity(points, normals, k=30):
     return np.einsum('ij,ij->i', centroids - points, normals)
 
 
+def otsu_threshold(values, n_bins=256):
+    """Automatic bimodal threshold (Otsu's method) over `values` -- used by
+    EyeDetector when auto_concavity_threshold is true, so a first pass at a
+    new camera/potato batch doesn't need a hand-picked concavity_threshold
+    (which depends on scan density/noise and will drift between setups).
+    Assumes the concavity distribution is roughly bimodal (flat surface vs.
+    eye pits); falls back to the median if the histogram is degenerate (all
+    one value) rather than dividing by zero."""
+    values = np.asarray(values, dtype=float)
+    if values.max() == values.min():
+        return float(np.median(values))
+
+    hist, bin_edges = np.histogram(values, bins=n_bins)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    hist = hist.astype(float)
+
+    weight1 = np.cumsum(hist)
+    weight2 = np.cumsum(hist[::-1])[::-1]
+    sum1 = np.cumsum(hist * bin_centers)
+    sum2 = np.cumsum((hist * bin_centers)[::-1])[::-1]
+
+    # Only bins with nonzero mass on BOTH sides define a valid split point.
+    valid = (weight1[:-1] > 0) & (weight2[1:] > 0)
+    if not np.any(valid):
+        return float(np.median(values))
+
+    mean1 = sum1[:-1] / np.maximum(weight1[:-1], 1e-9)
+    mean2 = sum2[1:] / np.maximum(weight2[1:], 1e-9)
+    variance_between = np.where(
+        valid, weight1[:-1] * weight2[1:] * (mean1 - mean2) ** 2, -np.inf)
+
+    idx = int(np.argmax(variance_between))
+    return float(bin_centers[idx])
+
+
 def normal_to_quat(normal):
     """Quaternion whose local +Z axis aligns with `normal` (used as the
     drill approach/insertion axis downstream)."""
@@ -55,7 +90,8 @@ class EyeDetector(Node):
         super().__init__('eye_detector')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('knn', 30)
-        self.declare_parameter('concavity_threshold', 0.0015)  # meters, tune per scan density
+        self.declare_parameter('concavity_threshold', 0.0015)  # meters, tune per scan density -- ignored if auto_concavity_threshold is true
+        self.declare_parameter('auto_concavity_threshold', False)  # true = pick the threshold per-scan via Otsu's method instead of the fixed value above
         self.declare_parameter('cluster_eps', 0.003)
         self.declare_parameter('cluster_min_points', 8)
         self.declare_parameter('min_eye_diameter', 0.002)
@@ -64,6 +100,7 @@ class EyeDetector(Node):
         self.base_frame = self.get_parameter('base_frame').value
         self.knn = self.get_parameter('knn').value
         self.concavity_threshold = self.get_parameter('concavity_threshold').value
+        self.auto_concavity_threshold = self.get_parameter('auto_concavity_threshold').value
         self.cluster_eps = self.get_parameter('cluster_eps').value
         self.cluster_min_points = self.get_parameter('cluster_min_points').value
         self.min_eye_diameter = self.get_parameter('min_eye_diameter').value
@@ -99,7 +136,12 @@ class EyeDetector(Node):
         normals = np.asarray(pcd.normals)
 
         concavity = estimate_concavity(pts, normals, k=self.knn)
-        pit_mask = concavity > self.concavity_threshold
+        if self.auto_concavity_threshold:
+            threshold = otsu_threshold(concavity)
+            self.get_logger().info(f'auto_concavity_threshold=true: computed threshold={threshold:.5f}')
+        else:
+            threshold = self.concavity_threshold
+        pit_mask = concavity > threshold
         if not np.any(pit_mask):
             self.get_logger().info('no eye candidates found')
             return

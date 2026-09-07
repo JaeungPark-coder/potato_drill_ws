@@ -24,6 +24,7 @@ an orientation the arm can actually reach before giving up on an eye.
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import ReentrantCallbackGroup
 from std_msgs.msg import Bool
 from geometry_msgs.msg import PoseArray
 from scipy.spatial.transform import Rotation as Rot
@@ -53,6 +54,13 @@ def normal_rotation(normal):
 class DrillController(Node):
     def __init__(self):
         super().__init__('drill_controller')
+
+        # See main()'s MultiThreadedExecutor for why this exists:
+        # robot_backend=isaac_sim's move_to_pose (TF) and force_drill (the
+        # wrench subscription) both block in polling loops from inside
+        # run_drilling, itself called from the start_drilling subscription
+        # callback -- those need to run concurrently, not queued behind it.
+        self._cb_group = ReentrantCallbackGroup()
 
         self.declare_parameter('robot_ip', '192.168.1.100')
         self.declare_parameter('robot_backend', 'rtde')  # 'rtde' or 'isaac_sim' -- see scan_controller.py
@@ -92,7 +100,8 @@ class DrillController(Node):
         if backend == 'isaac_sim':
             self.robot = IsaacSimRobotInterface(
                 self, base_frame=self.get_parameter('base_frame').value,
-                tcp_frame=self.get_parameter('tcp_frame').value)
+                tcp_frame=self.get_parameter('tcp_frame').value,
+                callback_group=self._cb_group)
         else:
             self.robot = UR5eInterface(
                 self.get_parameter('robot_ip').value,
@@ -101,8 +110,10 @@ class DrillController(Node):
                 drill_output_pin=self.get_parameter('drill_output_pin').value)
 
         self._eyes = None  # list of (position, normal)
-        self.create_subscription(PoseArray, '/potato_scan/eye_poses', self._on_eye_poses, 10)
-        self.create_subscription(Bool, '/potato_scan/start_drilling', self._on_start, 10)
+        self.create_subscription(
+            PoseArray, '/potato_scan/eye_poses', self._on_eye_poses, 10, callback_group=self._cb_group)
+        self.create_subscription(
+            Bool, '/potato_scan/start_drilling', self._on_start, 10, callback_group=self._cb_group)
         self.status_pub = self.create_publisher(Bool, '/potato_scan/drilling_complete', 10)
 
     def _on_eye_poses(self, msg: PoseArray):
@@ -181,8 +192,16 @@ class DrillController(Node):
 def main():
     rclpy.init()
     node = DrillController()
+    # MultiThreadedExecutor -- see scan_controller.py's main() for why:
+    # robot_backend=isaac_sim's move_to_pose (TF) and force_drill (the
+    # /isaac_sim/drill_tip/wrench subscription) both block in polling loops
+    # from inside run_drilling, itself called from the start_drilling
+    # subscription callback -- all on this same node, so those OTHER
+    # subscriptions need to run concurrently, not queued behind it.
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
         node.robot.close()
         node.destroy_node()

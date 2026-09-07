@@ -152,8 +152,19 @@ class ContactForceReader:
     policy as a sign this fell back rather than a sign of success.
     """
 
-    def __init__(self, prim_path, radius=0.002):
+    def __init__(self, prim_path, radius=0.002, suspicious_zero_streak=200):
         self._ok = False
+        self._prim_path = prim_path
+        # If read() keeps coming back exactly zero for this many consecutive
+        # calls, warn once -- at force_drill's typical ~50Hz poll_dt=0.02s,
+        # 200 reads is ~4s, comfortably longer than a real insertion should
+        # go without ANY force reading if the tip is actually advancing into
+        # the potato. Construction succeeding (self._ok=True below) only
+        # means the ContactSensor object was created; it does NOT confirm
+        # it's actually registering real PhysX contacts, which this catches.
+        self._suspicious_zero_streak = suspicious_zero_streak
+        self._zero_read_streak = 0
+        self._warned_suspicious = False
         try:
             from isaacsim.sensors.physics import ContactSensor
             self._sensor = ContactSensor(
@@ -176,6 +187,22 @@ class ContactForceReader:
             return np.zeros(3)
         frame = self._sensor.get_current_frame()
         force_mag = float(frame.get("force", 0.0) or 0.0)
+
+        if force_mag == 0.0:
+            self._zero_read_streak += 1
+        else:
+            self._zero_read_streak = 0
+        if not self._warned_suspicious and self._zero_read_streak >= self._suspicious_zero_streak:
+            self._warned_suspicious = True
+            carb.log_warn(
+                f"ContactSensor at {self._prim_path} has read exactly zero force "
+                f"{self._zero_read_streak} times in a row. If the drill tip should be touching the "
+                "potato by now, this sensor likely isn't registering real contacts (wrong prim path, "
+                "sensor radius too small, or a physics substep/collision setup issue) -- NOT that the "
+                "drill is genuinely floating in free space. force_drill will still run to max_depth and "
+                "LOOK like a clean, force-free insertion in this case -- treat that as a red flag to "
+                "check the sensor, not as a successful drill, until this is confirmed working against a "
+                "known real contact.")
         return np.array([force_mag, 0.0, 0.0])
 
 

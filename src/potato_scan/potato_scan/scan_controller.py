@@ -38,7 +38,8 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from rclpy.callback_groups import ReentrantCallbackGroup
+from std_msgs.msg import Bool, Int32
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from visualization_msgs.msg import Marker, MarkerArray
@@ -54,6 +55,13 @@ from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 class ScanController(Node):
     def __init__(self):
         super().__init__('scan_controller')
+
+        # See main()'s MultiThreadedExecutor for why this exists:
+        # robot_backend=isaac_sim's move_to_pose polls TF, and
+        # _wait_for_cloud_to_settle polls /potato_scan/point_count, both
+        # from inside _run_step's own timer callback -- those subscriptions
+        # need to run concurrently with _run_step, not queued behind it.
+        self._cb_group = ReentrantCallbackGroup()
 
         self.declare_parameter('robot_ip', '192.168.1.100')
         # 'rtde' talks to a real UR5e / URSim over RTDE (robot_interface.
@@ -129,7 +137,11 @@ class ScanController(Node):
         else:
             self.view_policy = None
 
-        self.create_subscription(PointCloud2, '/potato_scan/merged_cloud', self._on_cloud, 10)
+        self.create_subscription(
+            PointCloud2, '/potato_scan/merged_cloud', self._on_cloud, 10, callback_group=self._cb_group)
+        self._latest_point_count = None
+        self.create_subscription(
+            Int32, '/potato_scan/point_count', self._on_point_count, 10, callback_group=self._cb_group)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/potato_scan/view_candidates', 10)
         self.complete_pub = self.create_publisher(Bool, '/potato_scan/scan_complete', 10)
@@ -138,18 +150,22 @@ class ScanController(Node):
         if backend == 'isaac_sim':
             self.robot = IsaacSimRobotInterface(
                 self, base_frame=self.base_frame,
-                tcp_frame=self.get_parameter('tcp_frame').value)
+                tcp_frame=self.get_parameter('tcp_frame').value,
+                callback_group=self._cb_group)
         else:
             self.robot = UR5eInterface(self.get_parameter('robot_ip').value)
 
         self._last_direction = None
         self._views_taken = 0
         self._done = False
-        self.create_timer(0.5, self._run_step)
+        self.create_timer(0.5, self._run_step, callback_group=self._cb_group)
 
     def _on_cloud(self, msg: PointCloud2):
         pts = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
         self.coverage.set_from_points(pts, self.potato_center)
+
+    def _on_point_count(self, msg: Int32):
+        self._latest_point_count = msg.data
 
     def _publish_candidate_markers(self):
         dirs, filled, unscannable = self.coverage.all_cells_with_status()
@@ -188,7 +204,31 @@ class ScanController(Node):
 
         self.robot.move_to_pose(tcp_pos, tcp_rotvec)
         self._views_taken += 1
-        time.sleep(self.settle_time_s)
+        self._wait_for_cloud_to_settle()
+
+    def _wait_for_cloud_to_settle(self, poll_period_s=0.2, stable_reads_required=2):
+        """Waits for /potato_scan/point_count to stop growing (the merged
+        cloud has caught up with this view) instead of always sleeping the
+        full settle_time_s regardless of how long that actually takes --
+        still capped at settle_time_s so a view whose count never
+        stabilizes (stuck TF, dead camera) doesn't hang the scan. Relies on
+        _on_point_count running concurrently with this poll (both in
+        self._cb_group, spun via main()'s MultiThreadedExecutor) so the
+        count read here is actually live, not whatever it was before this
+        move started."""
+        t0 = time.time()
+        stable_count = 0
+        last_count = self._latest_point_count
+        while time.time() - t0 < self.settle_time_s:
+            time.sleep(poll_period_s)
+            current = self._latest_point_count
+            if current is not None and current == last_count:
+                stable_count += 1
+                if stable_count >= stable_reads_required:
+                    return
+            else:
+                stable_count = 0
+            last_count = current
 
     def _scan_with_recovery(self, e, a, direction, radius_scale=1.0):
         """Attempt the nominal view (at self.scan_radius * radius_scale --
@@ -275,8 +315,19 @@ class ScanController(Node):
 def main():
     rclpy.init()
     node = ScanController()
+    # MultiThreadedExecutor -- see ScanController.__init__'s _cb_group
+    # comment: robot_backend=isaac_sim's move_to_pose polls TF, and
+    # _wait_for_cloud_to_settle polls /potato_scan/point_count, both from
+    # inside _run_step's own timer callback. A single-threaded executor (or
+    # leaving these on the node's default MutuallyExclusiveCallbackGroup)
+    # can't service those other subscriptions while _run_step is still
+    # running, so the polled values would never actually refresh and every
+    # move/settle would just time out. Only matters for
+    # robot_backend=isaac_sim -- the real UR5e path talks to RTDE directly.
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
         node.robot.close()
         node.destroy_node()

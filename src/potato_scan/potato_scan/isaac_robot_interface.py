@@ -44,7 +44,15 @@ class IsaacSimRobotInterface:
                  wrench_topic='/isaac_sim/drill_tip/wrench',
                  drill_state_topic='/isaac_sim/drill_state',
                  pose_reach_tolerance_m=0.005, pose_reach_tolerance_deg=3.0,
-                 settle_timeout_s=6.0):
+                 settle_timeout_s=6.0, callback_group=None):
+        """callback_group: pass a ReentrantCallbackGroup shared with the
+        calling node's timer/subscription callbacks, spun via a
+        MultiThreadedExecutor -- move_to_pose/force_drill below block
+        polling TF and the wrench subscription from inside another callback
+        of the SAME node (e.g. scan_controller's _run_step timer, or
+        drill_controller's start_drilling subscription callback). Those
+        need to run concurrently with the poll, not queued behind it -- see
+        scan_controller.py / drill_controller.py's main()."""
         self.node = node
         self.base_frame = base_frame
         self.tcp_frame = tcp_frame
@@ -53,13 +61,19 @@ class IsaacSimRobotInterface:
         self.settle_timeout_s = settle_timeout_s
 
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, node)
+        # spin_thread=True: tf2_ros's own documented mechanism for exactly
+        # this situation -- gives the TF listener a dedicated background
+        # thread so it keeps processing transforms even while this node's
+        # other callbacks are busy elsewhere (belt-and-suspenders alongside
+        # callback_group/MultiThreadedExecutor below).
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, node, spin_thread=True)
 
         self.target_pub = node.create_publisher(PoseStamped, target_pose_topic, 10)
         self.drill_state_pub = node.create_publisher(Bool, drill_state_topic, 10)
 
         self._latest_wrench = None
-        node.create_subscription(WrenchStamped, wrench_topic, self._on_wrench, 10)
+        node.create_subscription(
+            WrenchStamped, wrench_topic, self._on_wrench, 10, callback_group=callback_group)
 
     def _on_wrench(self, msg: WrenchStamped):
         self._latest_wrench = msg
