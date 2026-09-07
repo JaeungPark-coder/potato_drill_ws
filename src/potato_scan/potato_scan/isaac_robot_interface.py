@@ -61,12 +61,22 @@ class IsaacSimRobotInterface:
         self.settle_timeout_s = settle_timeout_s
 
         self.tf_buffer = tf2_ros.Buffer()
-        # spin_thread=True: tf2_ros's own documented mechanism for exactly
-        # this situation -- gives the TF listener a dedicated background
-        # thread so it keeps processing transforms even while this node's
-        # other callbacks are busy elsewhere (belt-and-suspenders alongside
-        # callback_group/MultiThreadedExecutor below).
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, node, spin_thread=True)
+        # spin_thread=False (default): tf2_ros's TransformListener with
+        # spin_thread=True spins the SAME node in its own private
+        # SingleThreadedExecutor (see tf2_ros source), and rclpy.Node only
+        # belongs to one executor at a time -- Node.executor's setter calls
+        # remove_node() on whichever executor the node was previously
+        # attached to. Since this constructor runs before main() adds the
+        # node to the outer MultiThreadedExecutor, that's a real race: if
+        # the TF listener's background thread wins, it silently rips the
+        # node OUT of the MultiThreadedExecutor, so none of the node's own
+        # timers/subscriptions (start_drilling, _run_step, the wrench topic)
+        # get serviced again -- a nondeterministic hang. The outer
+        # MultiThreadedExecutor + ReentrantCallbackGroup this class already
+        # requires (see this method's own docstring) is sufficient to spin
+        # tf2_ros's internally-created ReentrantCallbackGroup subscriptions
+        # too, so a dedicated thread isn't needed.
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, node)
 
         self.target_pub = node.create_publisher(PoseStamped, target_pose_topic, 10)
         self.drill_state_pub = node.create_publisher(Bool, drill_state_topic, 10)

@@ -184,8 +184,24 @@ def main():
     # replace with your real hand-eye calibration translation/rotation once
     # measured (see handeye_calibration.py for the real-hardware equivalent).
     camera.AddTranslateOp().Set(Gf.Vec3d(0.0, -0.05, 0.05))
+    # See rl_scan_train_env.py's matching comment: USD cameras image along
+    # local -Z, while pose_utils.look_at_rotation / the hand-eye rotation use
+    # +Z as the optical axis, so without this flip the camera points 180
+    # degrees away from whatever the controller aimed the tool at (confirmed
+    # against an actual Isaac Sim run -- the point cloud contained only
+    # floor/background).
+    camera.AddRotateXOp().Set(180.0)
+    # See rl_scan_train_env.py's matching comment: a USD camera's default
+    # near clipping plane is 1.0m, which silently clips away anything this
+    # eye-in-hand camera is actually scanning (confirmed by measurement).
+    camera.CreateClippingRangeAttr().Set(Gf.Vec2f(0.01, 10000.0))
     render_product = rep.create.render_product(camera_path, (640, 480))
-    pointcloud_annotator = rep.AnnotatorRegistry.get_annotator("pointcloud")
+    # See rl_scan_train_env.py's matching comment -- includeUnlabelled=True
+    # is required or this annotator silently returns zero points for any
+    # prim without an explicit semantic label (confirmed against an actual
+    # Isaac Sim run).
+    pointcloud_annotator = rep.AnnotatorRegistry.get_annotator(
+        "pointcloud", init_params={"includeUnlabelled": True})
     pointcloud_annotator.attach([render_product])
 
     rmpflow, articulation_policy = setup_rmpflow(robot)

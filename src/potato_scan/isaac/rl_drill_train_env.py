@@ -46,7 +46,7 @@ from isaacsim.core.api import World  # noqa: E402
 from isaacsim.core.utils.extensions import enable_extension  # noqa: E402
 from isaacsim.core.utils.nucleus import get_assets_root_path  # noqa: E402
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage  # noqa: E402
-from isaacsim.core.prims import Articulation  # noqa: E402
+from isaacsim.core.prims import SingleArticulation  # noqa: E402
 
 # Bridges the ROS2-installed potato_scan package onto sys.path -- same
 # mechanism isaac_scene.py already relies on for `import rclpy`. Requires
@@ -96,8 +96,15 @@ class IsaacDrillEnv(gym.Env):
         self.stage = get_current_stage()
 
         add_reference_to_stage(assets_root + UR5E_ASSET_RELATIVE_PATH, ROBOT_PRIM_PATH)
-        self.robot = Articulation(ROBOT_PRIM_PATH)
+        # SingleArticulation (unbatched), not the vectorized Articulation --
+        # CONFIRMED (2026-09-07): RmpFlow's ArticulationMotionPolicy needs
+        # get_articulation_controller(), which only SingleArticulation
+        # provides (checked directly against the installed Isaac Sim API).
+        # Same class rl_scan_train_env.py / vla_ur5e_ws use for their own
+        # RMPflow-driven arm.
+        self.robot = SingleArticulation(ROBOT_PRIM_PATH, name="ur5e_arm")
         self.world.reset()  # initializes physics handles for the articulation
+        self.robot.initialize()
 
         drill_tip_path = add_drill_tip(self.stage, TOOL_LINK_PRIM_PATH)
         self.contact_reader = ContactForceReader(drill_tip_path)
@@ -118,7 +125,10 @@ class IsaacDrillEnv(gym.Env):
         _, eye_points, eye_normals = make_potato_mesh(
             self.stage, potato_prim_path, self.potato_center, seed=mesh_seed)
 
+        # See __init__'s comment -- a non-soft world.reset() invalidates
+        # self.robot's physics handles every time, not just once.
         self.world.reset()  # re-homes the robot articulation
+        self.robot.initialize()
 
         idx = int(self._rng.integers(0, len(eye_points)))
         self.eye_position = eye_points[idx]

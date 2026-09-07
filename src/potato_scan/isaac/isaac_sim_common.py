@@ -23,10 +23,12 @@ from pxr import UsdGeom, UsdPhysics, Gf
 # search "ur5e" to find the correct path for your install, then paste it here.
 UR5E_ASSET_RELATIVE_PATH = "/Isaac/Robots/UniversalRobots/ur5e/ur5e.usd"
 
-# ADJUST: exact prim names inside the loaded UR5e USD. Check the Stage window
-# after the robot loads if TF/camera/drill placement looks wrong.
+# CONFIRMED (2026-09-07, real Isaac Sim run against this same UR5e asset in
+# the sibling vla_ur5e_ws project): there is no "tool0" prim on this asset
+# (that's a ROS URDF-ism, not what this USD uses) -- the real tool flange
+# child Xform is wrist_3_link/flange.
 ROBOT_PRIM_PATH = "/World/ur5e"
-TOOL_LINK_PRIM_PATH = "/World/ur5e/tool0"
+TOOL_LINK_PRIM_PATH = "/World/ur5e/wrist_3_link/flange"
 
 
 def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35,

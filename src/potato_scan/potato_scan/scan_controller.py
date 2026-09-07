@@ -206,7 +206,7 @@ class ScanController(Node):
         self._views_taken += 1
         self._wait_for_cloud_to_settle()
 
-    def _wait_for_cloud_to_settle(self, poll_period_s=0.2, stable_reads_required=2):
+    def _wait_for_cloud_to_settle(self, poll_period_s=0.2, stable_reads_required=2, min_wait_s=1.1):
         """Waits for /potato_scan/point_count to stop growing (the merged
         cloud has caught up with this view) instead of always sleeping the
         full settle_time_s regardless of how long that actually takes --
@@ -215,16 +215,24 @@ class ScanController(Node):
         _on_point_count running concurrently with this poll (both in
         self._cb_group, spun via main()'s MultiThreadedExecutor) so the
         count read here is actually live, not whatever it was before this
-        move started."""
+        move started.
+
+        min_wait_s: floor beneath which "stable" reads don't count, even if
+        two consecutive polls happen to match -- pointcloud_accumulator.py's
+        publish_status timer only fires once per second, so polling every
+        poll_period_s=0.2s would otherwise see the same not-yet-updated
+        count twice within ~0.4s almost every time and return before the
+        new view's points have actually been merged/published."""
         t0 = time.time()
         stable_count = 0
         last_count = self._latest_point_count
         while time.time() - t0 < self.settle_time_s:
             time.sleep(poll_period_s)
             current = self._latest_point_count
+            elapsed = time.time() - t0
             if current is not None and current == last_count:
                 stable_count += 1
-                if stable_count >= stable_reads_required:
+                if stable_count >= stable_reads_required and elapsed >= min_wait_s:
                     return
             else:
                 stable_count = 0
