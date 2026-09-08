@@ -106,10 +106,26 @@ class IsaacDrillEnv(gym.Env):
         self.world.reset()  # initializes physics handles for the articulation
         self.robot.initialize()
 
-        drill_tip_path = add_drill_tip(self.stage, TOOL_LINK_PRIM_PATH)
-        self.contact_reader = ContactForceReader(drill_tip_path)
-
         self.rmpflow, self.articulation_policy = setup_rmpflow(self.robot)
+
+        # Poses are commanded to RMPflow, which drives the frame its config
+        # names ("tool0"), but the drill tip has to be parented to a real USD
+        # prim (TOOL_LINK_PRIM_PATH). MEASURED (2026-09-07): the two share a
+        # position exactly but differ in orientation by about (-90, -90, 0)
+        # degrees on this asset, so mounting the bit straight onto the flange
+        # would aim it well away from the insertion axis force_drill drives.
+        # Same correction rl_scan_train_env.py applies to its camera.
+        q0 = np.asarray(self.robot.get_joint_positions())[:6]
+        _, tool0_rot = self.rmpflow.get_end_effector_pose(q0)
+        tool0_rot = np.asarray(tool0_rot)
+        r_tool0 = (Rot.from_matrix(tool0_rot) if tool0_rot.shape == (3, 3)
+                   else Rot.from_quat(tool0_rot[[1, 2, 3, 0]]))
+        _, flange_quat = prim_world_pose(self.stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH))
+        self.r_flange_to_tool0 = Rot.from_quat(flange_quat).inv() * r_tool0
+
+        drill_tip_path = add_drill_tip(self.stage, TOOL_LINK_PRIM_PATH,
+                                        r_parent_to_tool=self.r_flange_to_tool0)
+        self.contact_reader = ContactForceReader(drill_tip_path)
 
         self.eye_position = None
         self.eye_normal = None
@@ -165,13 +181,37 @@ class IsaacDrillEnv(gym.Env):
         tcp_pos, _ = prim_world_pose(self.stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH))
         obs = drill_policy_spec.build_observation(self.eye_position, self.eye_normal, tcp_pos)
         info = {"attempts": self.attempts}
+
+        # Console progress readout -- this env renders nothing task-specific
+        # in the GUI, so without this there is no way to tell an insertion
+        # that reached depth from one that stalled on force.
+        if not moved:
+            _pe, _re, _cur, _tgt = self._last_move_err
+            print(f"  attempt {self.attempts}/{self.max_attempts_per_episode}: "
+                  f"UNREACHABLE approach pose, reward={reward:+.2f} "
+                  f"[pos_err={_pe * 1000:.0f}mm rot_err={_re:.0f}deg "
+                  f"target={np.round(_tgt, 3)} actual={np.round(_cur, 3)} "
+                  f"eye={np.round(self.eye_position, 3)}]")
+        else:
+            print(f"  attempt {self.attempts}/{self.max_attempts_per_episode}: "
+                  f"{'REACHED depth' if reached else 'stopped on force'} "
+                  f"(force_overshoot={force_overshoot_ratio:.2f}, roll={roll_deg:+.0f}deg) "
+                  f"reward={reward:+.2f}")
         return obs, reward, terminated, truncated, info
 
-    def _move_and_settle(self, target_pos, target_rotvec, pos_tol_m=0.005, rot_tol_deg=3.0):
+    def _move_and_settle(self, target_pos, target_rotvec, pos_tol_m=0.02, rot_tol_deg=8.0):
         """Same tolerance-polling contract as
         IsaacSimRobotInterface.move_to_pose (over ROS2/TF at deployment),
         done here with direct in-process prim reads. Returns True if the
-        tool0 link settled within tolerance before move_timeout_s."""
+        tool0 link settled within tolerance before move_timeout_s.
+
+        MEASURED (2026-09-07) against this scene: RMPflow is a reactive
+        controller and lands roughly 2-20mm / 2-12deg from these targets, so
+        the original 5mm/3deg tolerance was effectively never met. That
+        matters far more here than in the scan env: step() treats a False
+        return as "unreachable" and skips the insertion entirely, so with the
+        old tolerance the policy would have been scored on attempts it never
+        actually drilled."""
         target_pos = np.asarray(target_pos, dtype=float)
         target_rot = Rot.from_rotvec(np.asarray(target_rotvec, dtype=float))
         target_quat_wxyz = target_rot.as_quat()[[3, 0, 1, 2]]
@@ -186,31 +226,53 @@ class IsaacDrillEnv(gym.Env):
             self.robot.apply_action(action)
             self.world.step(render=True)
 
-            cur_pos, cur_quat = prim_world_pose(self.stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH))
-            cur_rotvec = Rot.from_quat(cur_quat).as_rotvec()
-            pos_err = float(np.linalg.norm(cur_pos - target_pos))
-            rot_err = (Rot.from_rotvec(cur_rotvec).inv() * target_rot).magnitude()
+            # Compare against RMPflow's OWN end-effector frame, not the USD
+            # flange prim. Both are commanded the same target, but the two
+            # frames differ in orientation by about (-90, -90, 0) degrees on
+            # this asset (see __init__), so reading the flange's rotation made
+            # rot_err permanently ~127deg and this loop could never report
+            # success -- which step() then scored as "unreachable", skipping
+            # every single insertion.
+            cur_pos, cur_rot = self.rmpflow.get_end_effector_pose(
+                np.asarray(self.robot.get_joint_positions())[:6])
+            cur_rot = np.asarray(cur_rot)
+            r_cur = (Rot.from_matrix(cur_rot) if cur_rot.shape == (3, 3)
+                     else Rot.from_quat(cur_rot[[1, 2, 3, 0]]))
+            pos_err = float(np.linalg.norm(np.asarray(cur_pos) - target_pos))
+            rot_err = (r_cur.inv() * target_rot).magnitude()
             if pos_err <= pos_tol_m and rot_err <= rot_tol_rad:
                 reached = True
                 break
+
+        self._last_move_err = (pos_err, float(np.degrees(rot_err)),
+                               np.asarray(cur_pos), target_pos)
 
         for _ in range(self.settle_steps):
             self.world.step(render=True)
         return reached
 
     def _force_insert(self, approach_pos, rotvec):
-        """Feeds along the negative Z axis of `rotvec` (the approach's own
-        insertion axis, i.e. INTO the surface) in small position steps,
-        reading simulated contact force each step -- same step-based
-        approximation isaac_robot_interface.IsaacSimRobotInterface.force_drill
-        uses at deployment (axis_index=2, same step_size_m default).
+        """Feeds along the +Z axis of `rotvec` -- which compose_approach_pose
+        now aims INTO the surface -- in small position steps, reading
+        simulated contact force each step.
+
+        NOTE: the deployment-side force_drill implementations
+        (isaac_robot_interface.py and robot_interface.py) still feed along
+        -Z, matching the old outward-facing tool convention. They need the
+        same flip before the ROS2 path is run, or sim and deployment will
+        drill in opposite directions.
 
         Returns (reached: bool, force_overshoot_ratio: float) -- reached
         is True if max_depth was hit before max_force; force_overshoot_ratio
         is how far the peak observed force went past max_force, as a
         fraction of max_force (0 if it never got close)."""
         rot_matrix = Rot.from_rotvec(np.asarray(rotvec, dtype=float)).as_matrix()
-        insertion_axis = rot_matrix[:, 2]  # +Z = outward normal-ish; feed INTO the surface = -axis
+        # compose_approach_pose now aims the tool INTO the surface (+Z =
+        # -normal, see its comment: the outward-facing pose is kinematically
+        # unreachable because the wrist would have to sit inside the potato),
+        # so feeding in is +axis. The drill bit add_drill_tip mounts along the
+        # tool's +Z leads the way, as it should.
+        insertion_axis = rot_matrix[:, 2]  # +Z now points INTO the surface
         target_quat_wxyz = Rot.from_rotvec(rotvec).as_quat()[[3, 0, 1, 2]]
 
         depth = 0.0
@@ -219,7 +281,7 @@ class IsaacDrillEnv(gym.Env):
         t0 = time.time()
         while time.time() - t0 < self.insertion_timeout_s:
             depth = min(depth + self.insertion_step_size_m, self.max_depth)
-            target_pos = np.asarray(approach_pos, dtype=float) - insertion_axis * depth
+            target_pos = np.asarray(approach_pos, dtype=float) + insertion_axis * depth
 
             self.rmpflow.set_end_effector_target(target_pos, target_quat_wxyz)
             self.rmpflow.update_world()

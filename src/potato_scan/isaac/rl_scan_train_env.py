@@ -293,10 +293,18 @@ class IsaacScanEnv(gym.Env):
             # annotator needs a rendered frame, GUI window or not.
             self.world.step(render=True)
 
-            cur_pos, cur_quat = prim_world_pose(self.stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH))
-            cur_rotvec = Rot.from_quat(cur_quat).as_rotvec()
-            pos_err = float(np.linalg.norm(cur_pos - target_pos))
-            rot_err = (Rot.from_rotvec(cur_rotvec).inv() * target_rot).magnitude()
+            # Compare against RMPflow's OWN end-effector frame, not the USD
+            # flange prim: they are the same point but ~(-90, -90, 0) degrees
+            # apart in orientation (see __init__), so reading the flange here
+            # left rot_err permanently around 127deg and this loop always ran
+            # its full timeout instead of stopping once the pose was reached.
+            cur_pos, cur_rot = self.rmpflow.get_end_effector_pose(
+                np.asarray(self.robot.get_joint_positions())[:6])
+            cur_rot = np.asarray(cur_rot)
+            r_cur = (Rot.from_matrix(cur_rot) if cur_rot.shape == (3, 3)
+                     else Rot.from_quat(cur_rot[[1, 2, 3, 0]]))
+            pos_err = float(np.linalg.norm(np.asarray(cur_pos) - target_pos))
+            rot_err = (r_cur.inv() * target_rot).magnitude()
             if pos_err <= pos_tol_m and rot_err <= rot_tol_rad:
                 break
 

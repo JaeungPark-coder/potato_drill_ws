@@ -113,10 +113,20 @@ def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35
     return mesh, eye_points, eye_normals
 
 
-def add_drill_tip(stage, parent_path, prim_path="drill_tip", length=0.02, radius=0.0015):
+def add_drill_tip(stage, parent_path, prim_path="drill_tip", length=0.02, radius=0.0015,
+                   r_parent_to_tool=None):
     """A small collider rigidly attached to the tool link, standing in
     for the physical drill bit -- gives PhysX something to report
     contact force on during force_drill's insertion.
+
+    r_parent_to_tool: scipy Rotation taking a vector expressed in the frame
+    the motion controller drives (RMPflow's "tool0") into `parent_path`'s
+    own frame. MEASURED on this UR5e asset (2026-09-07): those two frames
+    share a position but their orientations differ by about
+    (-90, -90, 0) degrees, so "extends along tool +Z" below is only true
+    once that rotation is applied -- without it the bit sticks out roughly
+    sideways from the direction force_drill believes it is inserting.
+    Defaults to identity for callers that genuinely mount on the tool frame.
 
     Deliberately does NOT apply RigidBodyAPI: drill_tip is a child prim of
     tool0 (an articulation link), so giving it its own RigidBodyAPI would
@@ -131,7 +141,16 @@ def add_drill_tip(stage, parent_path, prim_path="drill_tip", length=0.02, radius
     cyl = UsdGeom.Cylinder.Define(stage, full_path)
     cyl.CreateHeightAttr(length)
     cyl.CreateRadiusAttr(radius)
-    cyl.AddTranslateOp().Set(Gf.Vec3d(0, 0, length / 2))  # extends out along tool +Z
+
+    offset = np.array([0.0, 0.0, length / 2.0])  # extends out along tool +Z
+    if r_parent_to_tool is not None:
+        offset = r_parent_to_tool.apply(offset)
+        q = r_parent_to_tool.as_quat()  # xyzw
+        cyl.AddTranslateOp().Set(Gf.Vec3d(*offset))
+        # a UsdGeom.Cylinder is Z-aligned, so the same rotation aims the bit
+        cyl.AddOrientOp().Set(Gf.Quatf(float(q[3]), float(q[0]), float(q[1]), float(q[2])))
+    else:
+        cyl.AddTranslateOp().Set(Gf.Vec3d(*offset))
     prim = cyl.GetPrim()
     UsdPhysics.CollisionAPI.Apply(prim)
     return full_path

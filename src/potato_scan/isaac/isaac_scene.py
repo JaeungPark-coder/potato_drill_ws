@@ -62,7 +62,7 @@ from isaacsim.core.api import World
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.utils.nucleus import get_assets_root_path
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
-from isaacsim.core.prims import Articulation
+from isaacsim.core.prims import SingleArticulation
 
 enable_extension("isaacsim.ros2.bridge")  # makes rclpy importable/usable in this process
 
@@ -167,8 +167,12 @@ def main():
 
     stage = get_current_stage()
     add_reference_to_stage(assets_root + UR5E_ASSET_RELATIVE_PATH, ROBOT_PRIM_PATH)
-    robot = Articulation(ROBOT_PRIM_PATH)
+    # SingleArticulation (unbatched), not the vectorized Articulation --
+    # RmpFlow's ArticulationMotionPolicy needs get_articulation_controller(),
+    # which only SingleArticulation provides (same fix the two RL envs carry).
+    robot = SingleArticulation(ROBOT_PRIM_PATH, name="ur5e_arm")
     world.reset()  # initializes physics handles for the articulation
+    robot.initialize()
 
     make_potato_mesh(stage, "/World/potato", POTATO_CENTER, seed=POTATO_SEED)
 
@@ -176,21 +180,40 @@ def main():
     if not tool_prim.IsValid():
         carb.log_warn(f"{TOOL_LINK_PRIM_PATH} not found -- check the robot's actual link names "
                        f"in the Stage window and update TOOL_LINK_PRIM_PATH.")
-    drill_tip_path = add_drill_tip(stage, TOOL_LINK_PRIM_PATH)
+
+    rmpflow, articulation_policy = setup_rmpflow(robot)
+
+    # RMPflow drives the frame its config names ("tool0"); the camera and
+    # drill tip have to hang off a real USD prim (TOOL_LINK_PRIM_PATH).
+    # MEASURED (2026-09-07): same position, but orientations differ by about
+    # (-90, -90, 0) degrees on this asset -- see rl_scan_train_env.py, where
+    # mounting straight onto the flange left the point cloud empty on every
+    # view. Measured here rather than hard-coded.
+    q0 = np.asarray(robot.get_joint_positions())[:6]
+    _, tool0_rot = rmpflow.get_end_effector_pose(q0)
+    tool0_rot = np.asarray(tool0_rot)
+    r_tool0 = (Rot.from_matrix(tool0_rot) if tool0_rot.shape == (3, 3)
+               else Rot.from_quat(tool0_rot[[1, 2, 3, 0]]))
+    _, flange_quat = prim_world_pose(stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH))
+    r_flange_to_tool0 = Rot.from_quat(flange_quat).inv() * r_tool0
+
+    drill_tip_path = add_drill_tip(stage, TOOL_LINK_PRIM_PATH,
+                                    r_parent_to_tool=r_flange_to_tool0)
 
     camera_path = f"{TOOL_LINK_PRIM_PATH}/camera"
     camera = UsdGeom.Camera.Define(stage, camera_path)
     # ADJUST: this offset is a placeholder for the eye-in-hand mount --
     # replace with your real hand-eye calibration translation/rotation once
     # measured (see handeye_calibration.py for the real-hardware equivalent).
-    camera.AddTranslateOp().Set(Gf.Vec3d(0.0, -0.05, 0.05))
-    # See rl_scan_train_env.py's matching comment: USD cameras image along
-    # local -Z, while pose_utils.look_at_rotation / the hand-eye rotation use
-    # +Z as the optical axis, so without this flip the camera points 180
-    # degrees away from whatever the controller aimed the tool at (confirmed
-    # against an actual Isaac Sim run -- the point cloud contained only
-    # floor/background).
-    camera.AddRotateXOp().Set(180.0)
+    # It is authored in the flange frame, so the tool-frame offset is rotated.
+    camera.AddTranslateOp().Set(
+        Gf.Vec3d(*r_flange_to_tool0.apply(np.array([0.0, -0.05, 0.05]))))
+    # A USD camera images along local -Z while pose_utils.look_at_rotation
+    # puts the optical axis on +Z, so the mount carries a 180-degree flip
+    # about X on top of the frame correction above.
+    _q_cam = (r_flange_to_tool0 * Rot.from_euler("x", 180.0, degrees=True)).as_quat()  # xyzw
+    camera.AddOrientOp().Set(
+        Gf.Quatf(float(_q_cam[3]), float(_q_cam[0]), float(_q_cam[1]), float(_q_cam[2])))
     # See rl_scan_train_env.py's matching comment: a USD camera's default
     # near clipping plane is 1.0m, which silently clips away anything this
     # eye-in-hand camera is actually scanning (confirmed by measurement).
@@ -204,7 +227,6 @@ def main():
         "pointcloud", init_params={"includeUnlabelled": True})
     pointcloud_annotator.attach([render_product])
 
-    rmpflow, articulation_policy = setup_rmpflow(robot)
     contact_reader = ContactForceReader(drill_tip_path)
 
     rclpy.init()

@@ -71,7 +71,21 @@ def compose_approach_pose(position, normal, standoff, roll_deg, lateral_xy):
     applied about the insertion axis -- same roll convention
     drill_controller._find_reachable_approach uses. Returns
     (approach_position (3,), rotvec (3,))."""
-    base_rotation = normal_rotation(normal)
+    # The tool frame points INTO the surface (+Z = -normal), while the
+    # approach POSITION stays standoff metres out along the outward normal.
+    # normal_rotation's own "+Z is the outward normal" convention is left
+    # alone -- it is the perception-side contract shared with
+    # eye_detector.normal_to_quat -- and only the tool command is flipped.
+    #
+    # MEASURED (2026-09-08, RMPflow against a real potato mesh): a UR5e's
+    # wrist extends back along the tool's -Z, so commanding +Z = +normal
+    # asks the wrist to occupy the potato's own volume. Across three real
+    # eyes that pose was never reachable (position error 78/102/154mm,
+    # rotation error 17/27/88deg), while +Z = -normal reached every one of
+    # them (18/19/18mm, 2/1/6deg). The drill bit, which add_drill_tip
+    # extends along the tool's +Z, correspondingly now points into the
+    # surface rather than away from it.
+    base_rotation = normal_rotation(-np.asarray(normal, dtype=float))
     x_axis, y_axis = base_rotation[:, 0], base_rotation[:, 1]
 
     approach = approach_pose(position, normal, standoff)
