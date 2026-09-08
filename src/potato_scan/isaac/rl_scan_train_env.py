@@ -112,23 +112,41 @@ class IsaacScanEnv(gym.Env):
         self.world.reset()  # initializes physics handles for the articulation
         self.robot.initialize()
 
+        self.rmpflow, self.articulation_policy = setup_rmpflow(self.robot)
+
+        # The pose targets in step() are commanded to RMPflow, which drives the
+        # frame its config names -- "tool0" -- while the camera has to hang off
+        # a real USD prim (TOOL_LINK_PRIM_PATH, i.e. wrist_3_link/flange).
+        # MEASURED (2026-09-07) on this asset: those two frames share a
+        # position exactly (|tool0 - flange| = 0.0000 m) but their orientations
+        # differ by a fixed rotation of about (-90, -90, 0) degrees. Mounting
+        # the camera straight onto the flange therefore aimed it somewhere
+        # unrelated to the pose that was commanded, and the point cloud came
+        # back empty every step. Measure the offset here instead of hard-coding
+        # it, so this keeps working if the asset's frame conventions change.
+        q0 = np.asarray(self.robot.get_joint_positions())[:6]
+        _, tool0_rot = self.rmpflow.get_end_effector_pose(q0)
+        tool0_rot = np.asarray(tool0_rot)
+        r_tool0 = (Rot.from_matrix(tool0_rot) if tool0_rot.shape == (3, 3)
+                   else Rot.from_quat(tool0_rot[[1, 2, 3, 0]]))
+        _, flange_quat = prim_world_pose(self.stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH))
+        self.r_flange_to_tool0 = Rot.from_quat(flange_quat).inv() * r_tool0
+
+        # A USD camera images along its local -Z (OpenGL convention) while
+        # pose_utils.look_at_rotation puts the optical axis on +Z (OpenCV /
+        # robotics convention, see its docstring), so the mount also carries a
+        # 180-degree flip about X on top of the frame correction above.
+        r_camera_in_flange = self.r_flange_to_tool0 * Rot.from_euler("x", 180.0, degrees=True)
+        q_cam = r_camera_in_flange.as_quat()  # xyzw
+
         camera_path = f"{TOOL_LINK_PRIM_PATH}/camera"
         camera = UsdGeom.Camera.Define(self.stage, camera_path)
-        camera.AddTranslateOp().Set(Gf.Vec3d(*tcp_cam_translation))
-        # CONFIRMED (2026-09-07, actual Isaac Sim run) root cause of coverage
-        # staying at 0.0% forever: a USD camera images along its local -Z
-        # (OpenGL convention), but pose_utils.look_at_rotation -- and the
-        # r_tcp_cam hand-eye rotation it composes with -- uses the
-        # OpenCV/robotics convention where the optical axis is +Z (see that
-        # function's own docstring). With no rotation op here the camera
-        # inherits the flange's orientation verbatim, so once _move_and_settle
-        # aimed the flange's +Z at the potato the camera was looking exactly
-        # 180 degrees the OTHER way: the arm reached its target to within
-        # 1.7mm while the point cloud contained nothing but floor/background
-        # (nearest point ~0.9m from a potato sitting 0.13m away, zero points
-        # ever inside the expected 0.015-0.07m radius band). RotateX(180)
-        # maps the camera's -Z view direction onto the flange's +Z.
-        camera.AddRotateXOp().Set(180.0)
+        # tcp_cam_translation is the hand-eye offset in the TCP (tool0) frame;
+        # this op is authored in the flange frame, so it needs rotating too.
+        camera.AddTranslateOp().Set(
+            Gf.Vec3d(*self.r_flange_to_tool0.apply(np.asarray(tcp_cam_translation, dtype=float))))
+        camera.AddOrientOp().Set(
+            Gf.Quatf(float(q_cam[3]), float(q_cam[0]), float(q_cam[1]), float(q_cam[2])))
         # CONFIRMED (2026-09-07, distance sweep against this exact scene): a
         # USD camera's default clippingRange is (1.0, 1000000), i.e. a 1 METRE
         # near plane -- so a potato orbited at scan_radius=0.15m was entirely
@@ -152,8 +170,6 @@ class IsaacScanEnv(gym.Env):
         self.pointcloud_annotator = rep.AnnotatorRegistry.get_annotator(
             "pointcloud", init_params={"includeUnlabelled": True})
         self.pointcloud_annotator.attach([render_product])
-
-        self.rmpflow, self.articulation_policy = setup_rmpflow(self.robot)
 
         self.coverage = None
         self.views_taken = 0
@@ -253,7 +269,7 @@ class IsaacScanEnv(gym.Env):
 
         return obs, reward, terminated, truncated, info
 
-    def _move_and_settle(self, target_pos, target_rotvec, pos_tol_m=0.005, rot_tol_deg=3.0):
+    def _move_and_settle(self, target_pos, target_rotvec, pos_tol_m=0.02, rot_tol_deg=8.0):
         """Drives RMPflow toward (target_pos, target_rotvec) and steps
         physics/render until the tool0 link settles within tolerance or
         move_timeout_s elapses -- same tolerance-polling contract
