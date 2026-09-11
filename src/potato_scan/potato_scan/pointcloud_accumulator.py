@@ -1,7 +1,27 @@
 """Accumulates the eye-in-hand camera's point clouds into the robot base
 frame for RViz visualization, and reports point-count growth so
 scan_controller can confirm a given view actually captured new surface
-(as opposed to looking at empty space / an occluded angle)."""
+(as opposed to looking at empty space / an occluded angle).
+
+Each incoming frame is statistically outlier-filtered BEFORE it is merged.
+Stereo depth sensors manufacture "flying pixels" along depth
+discontinuities -- points interpolated between the potato's silhouette and
+the background, which lie in empty space near the rim. They matter here
+twice over:
+
+  * scan_controller judges coverage by counting merged points per surface
+    direction, so flying pixels sitting in the radius band register as
+    surface that was never actually seen. Cells get marked covered, the
+    gap-filling phase never visits them, and the reconstruction keeps a
+    hole it believes it has filled.
+  * eye_detector estimates normals and concavity from local neighbourhoods,
+    and these points are concentrated exactly at the rim, where the
+    detected eye normals are already least reliable.
+
+Filtering per frame rather than on the merged cloud is deliberate: the
+artefact is per-frame, and once many views are merged a flying pixel has
+genuine neighbours from other views to hide among.
+"""
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -31,9 +51,17 @@ class PointCloudAccumulator(Node):
         self.declare_parameter('camera_topic', '/camera/depth/color/points')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('voxel_size', 0.001)  # 1mm, potato-scale detail
+        # Statistical outlier removal on each incoming frame. A point is
+        # dropped when its mean distance to its `outlier_neighbors` nearest
+        # neighbours is more than `outlier_std_ratio` standard deviations
+        # above the frame's average. Set outlier_neighbors to 0 to disable.
+        self.declare_parameter('outlier_neighbors', 50)
+        self.declare_parameter('outlier_std_ratio', 1.5)
 
         self.base_frame = self.get_parameter('base_frame').value
         self.voxel_size = self.get_parameter('voxel_size').value
+        self.outlier_neighbors = self.get_parameter('outlier_neighbors').value
+        self.outlier_std_ratio = self.get_parameter('outlier_std_ratio').value
         camera_topic = self.get_parameter('camera_topic').value
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -68,8 +96,29 @@ class PointCloudAccumulator(Node):
 
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(pts_base)
+        cloud = self._remove_outliers(cloud)
         self.merged += cloud
         self.merged = self.merged.voxel_down_sample(self.voxel_size)
+
+    def _remove_outliers(self, cloud):
+        """Drop this frame's flying pixels. Skipped when disabled, or when
+        the frame holds too few points for the neighbourhood statistic to
+        mean anything -- filtering a handful of points would just delete
+        the frame."""
+        if self.outlier_neighbors <= 0:
+            return cloud
+        if len(cloud.points) <= self.outlier_neighbors:
+            return cloud
+
+        before = len(cloud.points)
+        filtered, _ = cloud.remove_statistical_outlier(
+            nb_neighbors=self.outlier_neighbors, std_ratio=self.outlier_std_ratio)
+        removed = before - len(filtered.points)
+        if removed:
+            self.get_logger().debug(
+                f'outlier filter dropped {removed}/{before} points '
+                f'({100.0 * removed / before:.1f}%)')
+        return filtered
 
     def publish_status(self):
         count = len(self.merged.points)

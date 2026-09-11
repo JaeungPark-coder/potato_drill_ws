@@ -201,7 +201,9 @@ class ContactForceReader:
         except Exception as exc:  # noqa: BLE001 -- best-effort sim sensor setup
             carb.log_warn(
                 f"ContactSensor setup failed ({exc}); drill_tip wrench will report zero force -- "
-                f"force_drill will always reach max_depth in sim, never stop on max_force.")
+                f"force_drill will never detect contact, so every insertion aborts as 'no_contact' "
+                f"once max_approach_travel is used up. Fix the sensor before reading anything into "
+                f"those failures.")
 
     def read(self):
         if not self._ok:
@@ -220,10 +222,10 @@ class ContactForceReader:
                 f"{self._zero_read_streak} times in a row. If the drill tip should be touching the "
                 "potato by now, this sensor likely isn't registering real contacts (wrong prim path, "
                 "sensor radius too small, or a physics substep/collision setup issue) -- NOT that the "
-                "drill is genuinely floating in free space. force_drill will still run to max_depth and "
-                "LOOK like a clean, force-free insertion in this case -- treat that as a red flag to "
-                "check the sensor, not as a successful drill, until this is confirmed working against a "
-                "known real contact.")
+                "drill is genuinely floating in free space. With contact-referenced depth, force_drill "
+                "reports 'no_contact' in this case rather than a clean insertion -- so treat a run of "
+                "'no_contact' outcomes as a red flag to check this sensor first, before suspecting the "
+                "eye poses it would otherwise be blaming.")
         return np.array([force_mag, 0.0, 0.0])
 
 

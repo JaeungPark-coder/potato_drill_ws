@@ -14,9 +14,17 @@ import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
 
-def look_at_rotation(cam_pos, target, up=(0.0, 0.0, 1.0)):
+def look_at_rotation(cam_pos, target, up=(0.0, 0.0, 1.0), roll_deg=0.0):
     """Rotation matrix (base frame) for a camera at cam_pos whose +Z
-    (optical axis) points at target."""
+    (optical axis) points at target.
+
+    `roll_deg` rotates the camera about that optical axis. Roll is a FREE
+    parameter for scanning: it spins the image in frame without changing
+    which surface patch is in frame, so the same view can be requested at
+    any roll. scan_controller sweeps it (CAMERA_ROLL_SEARCH_DEG) to reach
+    viewpoints the arm rejects at the default roll -- the same spare-DOF
+    trick drill_controller uses for the rotationally symmetric bit.
+    """
     cam_pos = np.asarray(cam_pos, dtype=float)
     target = np.asarray(target, dtype=float)
     up = np.asarray(up, dtype=float)
@@ -33,7 +41,10 @@ def look_at_rotation(cam_pos, target, up=(0.0, 0.0, 1.0)):
 
     y_axis = np.cross(z_axis, x_axis)
 
-    return np.column_stack((x_axis, y_axis, z_axis))
+    rot = np.column_stack((x_axis, y_axis, z_axis))
+    if roll_deg:
+        rot = rot @ Rot.from_euler('z', roll_deg, degrees=True).as_matrix()
+    return rot
 
 
 def rotmat_to_rotvec(rot_mat):

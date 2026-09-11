@@ -34,6 +34,34 @@ RECOVERY_OFFSETS = [
 ]
 
 
+def fit_sphere(points):
+    """Algebraic least-squares sphere fit. Returns (center, radius), or
+    (None, None) if the fit is degenerate.
+
+    Uses the linear form of the sphere equation: |p|^2 = 2*c.p + (r^2 -
+    |c|^2), which is linear in (c, r^2 - |c|^2) and so solves in one
+    lstsq with no initial guess. It tolerates a partial surface -- which
+    is the whole point here, since the centre is wanted while the scan is
+    still only part-way round the potato.
+    """
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 4:
+        return None, None
+
+    a_matrix = np.hstack([2.0 * pts, np.ones((len(pts), 1))])
+    b_vector = np.sum(pts ** 2, axis=1)
+    try:
+        solution, *_ = np.linalg.lstsq(a_matrix, b_vector, rcond=None)
+    except np.linalg.LinAlgError:
+        return None, None
+
+    center = solution[:3]
+    radius_squared = solution[3] + float(center @ center)
+    if not np.isfinite(radius_squared) or radius_squared <= 0.0:
+        return None, None
+    return center, float(np.sqrt(radius_squared))
+
+
 def direction_to_spherical(direction):
     direction = np.asarray(direction, dtype=float)
     direction = direction / np.linalg.norm(direction)
@@ -152,6 +180,49 @@ class SurfaceCoverageGrid:
                          0, self.n_elev - 1)
         a_idx = (azimuths / self.azimuth_bin_deg).astype(int) % self.n_az
         np.add.at(self.hits, (e_idx, a_idx), 1)
+
+    def estimate_center(self, points, prior_center, max_shift,
+                        min_points=800, min_move=0.001):
+        """Re-fit the potato's centre from the accumulated cloud.
+
+        `potato_center` is otherwise a hand-measured constant, but the
+        potato sits on top of a mounting pin: the fixture repeats its
+        lateral position well, while the HEIGHT of the potato's centre
+        moves with every potato, because a bigger potato's centre sits
+        further above the same pin. That constant is what look_at aims the
+        camera at and what this grid bins directions around, so an error
+        in it tilts the whole scan.
+
+        Points are selected with the prior centre's radius band, so this
+        refines an existing estimate rather than searching from nothing.
+
+        Returns the updated centre, or None to keep the current one --
+        when there is not enough data yet, when the fit is degenerate,
+        when the move is too small to be worth re-binning for, or when the
+        fit wants to move further than `max_shift` from the configured
+        centre (which means it latched onto the fixture or background
+        rather than the potato, and is not to be trusted).
+        """
+        if points is None or len(points) < min_points:
+            return None
+
+        prior_center = np.asarray(prior_center, dtype=float)
+        rel = np.asarray(points, dtype=float) - prior_center
+        radii = np.linalg.norm(rel, axis=1)
+        plausible = (radii >= self.min_expected_radius) & (radii <= self.max_expected_radius)
+        if int(np.count_nonzero(plausible)) < min_points:
+            return None
+
+        center, radius = fit_sphere(np.asarray(points, dtype=float)[plausible])
+        if center is None:
+            return None
+        if not (self.min_expected_radius <= radius <= self.max_expected_radius):
+            return None
+        if np.linalg.norm(center - prior_center) > max_shift:
+            return None
+        if np.linalg.norm(center - prior_center) < min_move:
+            return None
+        return center
 
     def filled_mask(self):
         return self.hits >= self.min_hits_to_fill

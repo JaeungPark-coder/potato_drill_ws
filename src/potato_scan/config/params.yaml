@@ -37,7 +37,24 @@ scan_controller:
     min_expected_radius: 0.015   # smaller than the smallest potato you'd ever load
     max_expected_radius: 0.07    # larger than the largest potato you'd ever load
     radius_band: 0.02
+    # The potato is mounted on a pin, so its centre HEIGHT changes with
+    # potato size even though the fixture repeats laterally. With auto on,
+    # potato_center above is a starting guess and a safety bound: the real
+    # centre is re-fitted from the accumulated cloud, and any fit further
+    # than potato_center_max_shift from the configured value is rejected
+    # as having latched onto the fixture or background.
+    potato_center_auto: true
+    potato_center_max_shift: 0.03
+    potato_center_min_points: 800
     scan_radius: 0.15
+    # PHASE A -- the fixed raster orbit every potato gets before any
+    # gap-filling: face the potato, sweep the camera up/down one vertical
+    # column, rotate azimuth_step_deg, sweep the next column, repeat.
+    # 45deg azimuth x 25deg elevation over the -15..85deg band = 8 columns
+    # x 5 rows = 40 views, leaving 20 of max_views for phase B.
+    raster_orbit: true
+    azimuth_step_deg: 45.0
+    elevation_step_deg: 25.0
     # Live coverage grid resolution (degrees per cell) around the potato.
     # Coverage is judged from real accumulated points landing in each
     # cell (surface_coverage.SurfaceCoverageGrid), not from a preset
@@ -70,6 +87,19 @@ pointcloud_accumulator:
     camera_topic: "/camera/depth/color/points"
     base_frame: "base_link"
     voxel_size: 0.001
+    # Statistical outlier removal, applied per incoming frame before the
+    # merge. Stereo depth invents "flying pixels" along the potato's
+    # silhouette; left in, they count as covered surface in
+    # scan_controller's coverage grid (so the gap-filling phase never
+    # revisits those directions) and corrupt the normals eye_detector
+    # estimates at the rim. 0 neighbours disables the filter.
+    # std_ratio chosen by sweep against a simulated silhouette-edge artefact
+    # (6000 surface points + 110 flying pixels, scored on the real
+    # SurfaceCoverageGrid): 1.0 removed all 110 but cost 35 real points and
+    # 3 genuinely-scanned cells; 1.5 removed all 110 for 4 real points and
+    # no lost cells; 2.5 started leaving flying pixels behind.
+    outlier_neighbors: 50
+    outlier_std_ratio: 1.5
 
 eye_detector:
   ros__parameters:
@@ -89,9 +119,41 @@ drill_controller:
     tcp_frame: "tool0"        # only used by isaac_sim backend
     drill_output_pin: 0       # UR5e tool digital output driving the drill relay
     standoff: 0.03            # approach distance above the eye, meters
-    max_depth: 0.015          # SAFETY LIMIT -- tune per potato/drill bit before running
+    # SAFETY LIMIT -- penetration measured from the DETECTED CONTACT POINT,
+    # not from the standoff approach pose (see robot_interface.force_drill).
+    # 8mm is grounded in the literature for potato eye tissue: Divyanth et
+    # al. 2025 punch to an intended 7.00mm with a 3.25mm blade and recover
+    # cores of 2.81-6.92mm (mean 5.84mm). The previous 0.015 was both
+    # deeper than anything that work needed AND smaller than `standoff`,
+    # which under the old from-the-approach-pose measurement meant the bit
+    # stopped 15mm short of the potato and reported success.
+    max_depth: 0.008
     feed_force: 15.0          # newtons, force-mode feed pressure into the surface
     max_force: 40.0           # SAFETY LIMIT -- abort insertion above this force
+    # Force at which the bit counts as having touched the potato; this is
+    # what defines depth zero for max_depth. Keep above the free-space
+    # noise floor and well below max_force.
+    contact_force: 5.0
+    # How far the real surface may sit from where eye detection put it.
+    # After feeding standoff + this much with no contact, the insertion
+    # aborts as 'no_contact' (bad eye pose / potato moved) instead of
+    # pushing into empty space.
+    surface_position_tolerance: 0.02
+    # Fixture keep-out. The potato is impaled on a pin, so a cone opening
+    # from its centre toward the fixture is solid hardware that the
+    # reachability search cannot see (driving into a pin is perfectly
+    # reachable). fixture_axis points from the potato centre toward the
+    # fixture: [0, 0, -1] for a potato on top of a vertical pin.
+    # potato_center here is a fallback only -- scan_controller publishes
+    # the centre it settled on over /potato_scan/potato_center.
+    potato_center: [0.50, 0.00, 0.15]
+    fixture_axis: [0.0, 0.0, -1.0]
+    fixture_keepout_half_angle_deg: 35.0
+    # Task tolerance on the insertion axis -- how far off the surface
+    # normal the drill may be aimed when no reachable pose exists straight
+    # down it. Tried smallest-first, so a tilt is only used as a fallback.
+    max_approach_tilt_deg: 15.0
+    approach_tilt_step_deg: 7.5
     approach_speed: 0.2
     approach_acceleration: 0.5
     drill_timeout_s: 8.0
@@ -110,7 +172,10 @@ force_drill_tuner:
     drill_output_pin: 0
     feed_force: 8.0     # start LOW, well under drill_controller's value above
     max_force: 25.0
-    max_depth: 0.015
+    max_depth: 0.008    # penetration past contact -- see drill_controller above
+    contact_force: 5.0
+    standoff: 0.03      # only used to bound the no-contact approach travel
+    surface_position_tolerance: 0.02
     drill_timeout_s: 8.0
 
 # Step 4 (optional, needs Isaac Sim): train RL policies that replace the

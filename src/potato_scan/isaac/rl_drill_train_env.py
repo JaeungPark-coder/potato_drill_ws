@@ -256,11 +256,14 @@ class IsaacDrillEnv(gym.Env):
         now aims INTO the surface -- in small position steps, reading
         simulated contact force each step.
 
-        NOTE: the deployment-side force_drill implementations
-        (isaac_robot_interface.py and robot_interface.py) still feed along
-        -Z, matching the old outward-facing tool convention. They need the
-        same flip before the ROS2 path is run, or sim and deployment will
-        drill in opposite directions.
+        The deployment-side force_drill implementations
+        (isaac_robot_interface.py and robot_interface.py) now feed along +Z
+        too, and drill_controller builds its tool rotation from -normal, so
+        sim and deployment drill in the same direction. They differ only in
+        where depth is measured from: deployment references it to a
+        detected contact point (the standoff gap is unknown there), while
+        this env starts already at the approach pose with the surface
+        position known exactly.
 
         Returns (reached: bool, force_overshoot_ratio: float) -- reached
         is True if max_depth was hit before max_force; force_overshoot_ratio
