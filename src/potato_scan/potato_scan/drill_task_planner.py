@@ -11,6 +11,7 @@ module scope, which isn't installed in a sim-only environment.
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.spatial.transform import Rotation as Rot
 
 
 def approach_blocked_by_fixture(approach_position, potato_center, fixture_axis,
@@ -368,3 +369,73 @@ def depth_collar_spec(bit_diameter_m, max_depth_m, max_force_n,
         'puncture_stress_pa': float(puncture_stress_pa),
         'safety_factor': float(safety_factor),
     }
+
+
+# Roll offsets (degrees, about the insertion axis) tried in order. The bit is
+# rotationally symmetric about its own axis, so roll changes the wrist
+# configuration without changing the drilling geometry at all -- it is free.
+ROLL_SEARCH_DEG = [0, 45, -45, 90, -90, 135, -135, 180]
+
+
+def normal_rotation(normal):
+    """Rotation whose +Z axis is `normal`.
+
+    This is the PERCEPTION-side convention, shared with
+    eye_detector.normal_to_quat. The TOOL is commanded with +Z pointing the
+    other way, INTO the surface, so callers pass -normal -- see
+    approach_candidates.
+    """
+    z = np.asarray(normal, dtype=float)
+    z = z / np.linalg.norm(z)
+    ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    x = np.cross(ref, z)
+    x = x / np.linalg.norm(x)
+    y = np.cross(z, x)
+    return np.column_stack((x, y, z))
+
+
+def tilt_search_sequence(max_tilt_deg, step_deg):
+    """[0, step, 2*step, ..., max] -- insertion-axis deviations in increasing
+    order, so a search always prefers going straight down the surface normal
+    and only opens the tolerance if it has to."""
+    if max_tilt_deg <= 0 or step_deg <= 0:
+        return [0.0]
+    n_steps = int(max_tilt_deg / step_deg)
+    tilts = [round(i * step_deg, 6) for i in range(n_steps + 1)]
+    if tilts[-1] < max_tilt_deg - 1e-9:
+        tilts.append(float(max_tilt_deg))
+    return tilts
+
+
+def approach_candidates(position, normal, standoff, tilt_search_deg=(0.0,),
+                        roll_search_deg=ROLL_SEARCH_DEG):
+    """(approach_position, rotvec, tilt_deg, roll_deg) for every approach
+    worth trying at one eye, ordered smallest-deviation-first.
+
+    Lives here rather than on the controller so that anything else aiming at
+    an eye -- the calliper check, a bench script -- uses the SAME convention
+    rather than a second copy of it that can drift. Two spare degrees of
+    freedom are swept:
+
+      roll -- free, see ROLL_SEARCH_DEG.
+      tilt -- a task TOLERANCE, not free: it aims the bit off the surface
+        normal, which does change the hole's angle, so it is only reached
+        after every roll at a smaller tilt has been rejected.
+
+    The tool frame points INTO the surface (+Z = -normal). Measured
+    (2026-09-08, RMPflow against a real potato mesh): a UR5e's wrist extends
+    back along the tool's -Z, so commanding +Z = +normal asks the wrist to
+    occupy the potato's own volume, and no roll offset makes that reachable.
+
+    With a tilt applied the approach POINT moves too -- taken back along the
+    tool's own axis rather than along the normal, since that axis is the line
+    the feed runs down. At zero tilt the two coincide exactly.
+    """
+    base_rotation = normal_rotation(-np.asarray(normal, dtype=float))
+    for tilt_deg in tilt_search_deg:
+        tilt = Rot.from_euler('x', tilt_deg, degrees=True).as_matrix()
+        for roll_deg in roll_search_deg:
+            roll = Rot.from_euler('z', roll_deg, degrees=True).as_matrix()
+            rotation = base_rotation @ roll @ tilt
+            approach = approach_pose_along_axis(position, rotation[:, 2], standoff)
+            yield approach, Rot.from_matrix(rotation).as_rotvec(), tilt_deg, roll_deg

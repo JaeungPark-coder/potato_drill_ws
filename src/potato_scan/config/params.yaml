@@ -46,6 +46,15 @@ scan_controller:
     potato_center_auto: true
     potato_center_max_shift: 0.03
     potato_center_min_points: 800
+    # Which depth camera is fitted. Checked at startup against the distance
+    # the scan actually uses, which is NOT scan_radius: the camera images the
+    # potato's SURFACE, a potato-radius nearer than its centre. At 0.15 m
+    # around the largest potato this fixture admits (max_expected_radius
+    # 0.07) the nearest surface sits 8 cm from the lens -- inside a D405's
+    # range, well inside a D435's minimum of ~16.8 cm, and far inside a
+    # D455's 0.40 m. Leave empty if unknown; that is reported, not assumed
+    # safe. Known names: d405, d435, d435i, d415, d455, gemini335.
+    camera_model: ""
     scan_radius: 0.15
     # PHASE A -- the fixed raster orbit every potato gets before any
     # gap-filling: face the potato, sweep the camera up/down one vertical

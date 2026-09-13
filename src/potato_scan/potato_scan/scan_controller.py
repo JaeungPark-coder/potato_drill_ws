@@ -64,6 +64,7 @@ from geometry_msgs.msg import Point, PointStamped
 from scipy.spatial.transform import Rotation as Rot
 
 from potato_scan.pose_utils import look_at_rotation, rotmat_to_rotvec, camera_pose_to_tcp_pose
+from potato_scan.camera_ranges import check as check_camera_range
 from potato_scan.run_metrics import PhaseTimer
 from potato_scan.scan_schedule import RasterOrbitSchedule
 from potato_scan.surface_coverage import SurfaceCoverageGrid
@@ -108,6 +109,10 @@ class ScanController(Node):
         self.declare_parameter('min_expected_radius', 0.015)
         self.declare_parameter('max_expected_radius', 0.07)
         self.declare_parameter('radius_band', 0.02)
+        # Which camera is fitted, so its minimum range can be checked against
+        # the distance this scan actually uses. Empty means unknown, which is
+        # reported rather than assumed safe.
+        self.declare_parameter('camera_model', '')
         self.declare_parameter('scan_radius', 0.15)
         self.declare_parameter('elevation_bin_deg', 8.0)
         self.declare_parameter('azimuth_bin_deg', 8.0)
@@ -166,6 +171,18 @@ class ScanController(Node):
         self.auto_center = self.get_parameter('potato_center_auto').value
         self.potato_center_max_shift = self.get_parameter('potato_center_max_shift').value
         self.potato_center_min_points = self.get_parameter('potato_center_min_points').value
+
+        # Checked against the LARGEST potato this fixture admits, because a
+        # bigger potato puts its surface closer to the lens -- the worst case
+        # is the big one, not the average one. Below the camera's minimum,
+        # depth does not degrade, it disappears, and an empty cloud reads as
+        # occlusion rather than as a camera that cannot focus this close.
+        camera_ok, camera_message = check_camera_range(
+            self.get_parameter('camera_model').value or 'unspecified',
+            self.get_parameter('scan_radius').value,
+            self.get_parameter('max_expected_radius').value)
+        (self.get_logger().info if camera_ok else self.get_logger().error)(
+            f'camera range: {camera_message}')
 
         self.r_tcp_cam = Rot.from_quat(self.get_parameter('tcp_cam_quat_xyzw').value).as_matrix()
         self.t_tcp_cam = np.array(self.get_parameter('tcp_cam_translation').value)

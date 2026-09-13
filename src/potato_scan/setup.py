@@ -30,6 +30,7 @@ setup(
             'drill_controller = potato_scan.drill_controller:main',
             'handeye_calibration = potato_scan.handeye_calibration:main',
             'force_drill_tuner = potato_scan.force_drill_tuner:main',
+            'calliper_check = potato_scan.calliper_check:main',
         ],
     },
 )

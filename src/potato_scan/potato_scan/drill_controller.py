@@ -39,44 +39,9 @@ from potato_scan.robot_interface import UR5eInterface
 from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 from potato_scan.run_metrics import RunMetrics
 from potato_scan.drill_task_planner import (
-    plan_visit_order, approach_pose_along_axis, approach_blocked_by_fixture,
-    helical_cut_path, EyeAttempt, format_attempt_table)
-
-# Roll offsets (degrees, about the insertion axis) tried in order when the
-# default approach orientation is unreachable. Smallest deviation from
-# the default first, then wider swings.
-ROLL_SEARCH_DEG = [0, 45, -45, 90, -90, 135, -135, 180]
-
-
-def _tilt_search_sequence(max_tilt_deg, step_deg):
-    """[0, step, 2*step, ..., max] -- the insertion-axis deviations tried,
-    in increasing order so the search always prefers drilling straight
-    down the surface normal and only opens up the tolerance if it has to."""
-    if max_tilt_deg <= 0 or step_deg <= 0:
-        return [0.0]
-    n_steps = int(max_tilt_deg / step_deg)
-    tilts = [round(i * step_deg, 6) for i in range(n_steps + 1)]
-    if tilts[-1] < max_tilt_deg - 1e-9:
-        tilts.append(float(max_tilt_deg))
-    return tilts
-
-
-def normal_rotation(normal):
-    """Rotation whose +Z axis is `normal` -- must match eye_detector's
-    normal_to_quat convention so orientations line up.
-
-    Note this is the PERCEPTION-side convention (+Z = outward surface
-    normal). The tool is commanded with +Z pointing the other way, INTO
-    the surface -- callers pass -normal here. See
-    _find_reachable_approach."""
-    z = np.asarray(normal, dtype=float)
-    z = z / np.linalg.norm(z)
-    ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-    x = np.cross(ref, z)
-    x = x / np.linalg.norm(x)
-    y = np.cross(z, x)
-    return np.column_stack((x, y, z))
-
+    plan_visit_order, approach_blocked_by_fixture, approach_candidates,
+    helical_cut_path, tilt_search_sequence, ROLL_SEARCH_DEG,
+    EyeAttempt, format_attempt_table)
 
 class DrillController(Node):
     def __init__(self):
@@ -163,7 +128,7 @@ class DrillController(Node):
         self.fixture_axis = np.array(self.get_parameter('fixture_axis').value, dtype=float)
         self.fixture_keepout_half_angle_deg = self.get_parameter(
             'fixture_keepout_half_angle_deg').value
-        self.tilt_search_deg = _tilt_search_sequence(
+        self.tilt_search_deg = tilt_search_sequence(
             self.get_parameter('max_approach_tilt_deg').value,
             self.get_parameter('approach_tilt_step_deg').value)
         self.max_approach_travel = (
@@ -318,42 +283,12 @@ class DrillController(Node):
             self.fixture_keepout_half_angle_deg)
 
     def _approach_candidates(self, position, normal):
-        """(approach_position, rotvec, tilt_deg, roll_deg) for every
-        approach worth trying, ordered smallest-deviation-first.
-
-        Two spare degrees of freedom are swept:
-
-          roll -- free. The bit is rotationally symmetric about its own
-            axis, so roll changes the wrist configuration without changing
-            the drilling geometry at all.
-          tilt -- a task TOLERANCE, not free. It aims the bit up to
-            max_approach_tilt_deg off the surface normal, which does change
-            the hole's angle, so it is only reached after every roll at a
-            smaller tilt has been rejected.
-
-        Tool frame points INTO the surface (+Z = -normal), the split
-        rl.drill_policy_spec.compose_approach_pose also makes, for the
-        reason measured there (2026-09-08, RMPflow against a real potato
-        mesh): a UR5e's wrist extends back along the tool's -Z, so
-        commanding +Z = +normal asks the wrist to occupy the potato's own
-        volume, and no roll offset makes that reachable. The drill bit
-        extends along the tool's +Z, so it leads.
-
-        With a tilt applied, the approach POINT moves too -- it is taken
-        back along the tool's own axis rather than along the normal, since
-        that axis is the line force_drill will feed down (see
-        drill_task_planner.approach_pose_along_axis). At zero tilt the two
-        coincide exactly.
-        """
-        base_rotation = normal_rotation(-np.asarray(normal, dtype=float))
-        for tilt_deg in self.tilt_search_deg:
-            tilt = Rot.from_euler('x', tilt_deg, degrees=True).as_matrix()
-            for roll_deg in ROLL_SEARCH_DEG:
-                roll = Rot.from_euler('z', roll_deg, degrees=True).as_matrix()
-                rotation = base_rotation @ roll @ tilt
-                approach = approach_pose_along_axis(
-                    position, rotation[:, 2], self.standoff)
-                yield approach, Rot.from_matrix(rotation).as_rotvec(), tilt_deg, roll_deg
+        """Delegates to drill_task_planner.approach_candidates so the pose
+        convention has exactly one definition -- the calliper check aims at
+        eyes through the same function."""
+        return approach_candidates(position, normal, self.standoff,
+                                   tilt_search_deg=self.tilt_search_deg,
+                                   roll_search_deg=ROLL_SEARCH_DEG)
 
     @staticmethod
     def _outcome_message(idx, outcome):
