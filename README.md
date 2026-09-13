@@ -53,6 +53,12 @@ separates "my install is wrong" from "my hardware is wrong":
 ```bash
 cd src/potato_scan
 
+# 125 checks over the geometry, planning and detection maths. ~30 s.
+python -m pytest test/ -q
+
+# the fast subset, if you just want to know the install is sound. ~2 s.
+python -m pytest test/ -q -m "not slow"
+
 # the view-budget sweep: runs the real coverage grid against simulated potatoes
 python -m potato_scan.scan_budget --potatoes 5
 
@@ -64,6 +70,18 @@ print(check('d435', 0.15, 0.07)[1])"
 
 If those run, the geometry half of the package is working and anything that
 breaks later is ROS, hardware, or calibration.
+
+The suite is worth a second look rather than just a green tick: each test is
+named for the property it holds, and several exist because the property
+failed once. `test_orientation.py` holds the drill pointing into the potato
+rather than away from it; `test_force_drill.py` holds depth measured from
+contact rather than from the approach pose; `test_cpu_improvements.py` holds
+a tilted approach still landing on the eye. If one of those goes red after a
+change, the name tells you what broke before you read any code.
+
+`test/` needs `pytest` (declared in `package.xml`, so `rosdep install`
+brings it) and nothing else — no ROS, no Open3D, no robot. It is the same
+suite `colcon test` runs.
 
 
 ## Bring-up order
