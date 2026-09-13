@@ -152,11 +152,25 @@ drill_controller:
     # which under the old from-the-approach-pose measurement meant the bit
     # stopped 15mm short of the potato and reported success.
     max_depth: 0.008
-    feed_force: 15.0          # newtons, force-mode feed pressure into the surface
-    max_force: 40.0           # SAFETY LIMIT -- abort insertion above this force
+    # Newtons of force-mode feed pressure into the surface. Published
+    # penetration tests put the peak force to puncture raw potato flesh
+    # through the skin at 41-47 N with a 2 mm probe (cv. Spunta), and eyes
+    # sit in the perimedullary zone, which is the LEAST resistant of the
+    # tuber's tissues -- so a feed well under the whole-skin puncture peak
+    # is the right magnitude for advancing through an eye.
+    feed_force: 15.0
+    # SAFETY LIMIT -- abort insertion above this force. 40 N is supported for
+    # softer cultivars but sits right at their puncture peak, so it can trip
+    # early on dense ones: a needle probe on cv. Kufri Badshah peaked at
+    # 79 N. Raise toward 60-90 N for those, and treat this as a per-cultivar
+    # setting rather than a constant.
+    max_force: 40.0
     # Force at which the bit counts as having touched the potato; this is
-    # what defines depth zero for max_depth. Keep above the free-space
-    # noise floor and well below max_force.
+    # what defines depth zero for max_depth. Keep above the free-space noise
+    # floor and well below max_force. 5 N is conservative by an order of
+    # magnitude against the 41-47 N it takes to actually puncture, and
+    # comfortably above the 0.2-2.5 N trigger forces texture analysers use
+    # to detect first contact with produce.
     contact_force: 5.0
     # How far the real surface may sit from where eye detection put it.
     # After feeding standoff + this much with no contact, the insertion

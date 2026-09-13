@@ -37,6 +37,7 @@ from scipy.spatial.transform import Rotation as Rot
 
 from potato_scan.robot_interface import UR5eInterface
 from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
+from potato_scan.run_metrics import RunMetrics
 from potato_scan.drill_task_planner import (
     plan_visit_order, approach_pose_along_axis, approach_blocked_by_fixture,
     helical_cut_path, EyeAttempt, format_attempt_table)
@@ -383,13 +384,16 @@ class DrillController(Node):
         order = plan_visit_order(positions, start_position=start_pos, normals=normals)
         self.get_logger().info(f'visiting {len(order)} eyes in order {order}')
 
+        metrics = RunMetrics()
+        metrics.eyes_detected = len(self._eyes)
         attempts = []
         for count, idx in enumerate(order):
             position, normal = self._eyes[idx]
 
             self.get_logger().info(f'[{count + 1}/{len(order)}] approaching eye {idx} at {position}')
-            approach, rotvec, tilt_deg, roll_deg, status = self._find_reachable_approach(
-                position, normal)
+            with metrics.timer('approach'):
+                approach, rotvec, tilt_deg, roll_deg, status = self._find_reachable_approach(
+                    position, normal)
             if approach is None:
                 self.get_logger().error(f'eye {idx}: {status} -- skipping')
                 attempts.append(EyeAttempt(index=idx, status=status))
@@ -397,28 +401,37 @@ class DrillController(Node):
 
             task_frame = list(approach) + list(rotvec)
             self.robot.drill_on()
-            outcome = self.robot.force_drill(
-                task_frame, axis_index=2,
-                feed_force=self.feed_force, max_force=self.max_force,
-                max_depth=self.max_depth, timeout_s=self.drill_timeout_s,
-                contact_force=self.contact_force,
-                max_approach_travel=self.max_approach_travel)
+            with metrics.timer('drill'):
+                outcome = self.robot.force_drill(
+                    task_frame, axis_index=2,
+                    feed_force=self.feed_force, max_force=self.max_force,
+                    max_depth=self.max_depth, timeout_s=self.drill_timeout_s,
+                    contact_force=self.contact_force,
+                    max_approach_travel=self.max_approach_travel)
             self._report_outcome(idx, outcome)
             attempts.append(EyeAttempt(
                 index=idx, status=outcome.status, depth_m=outcome.depth_m,
                 peak_force_n=outcome.peak_force_n, tilt_deg=tilt_deg, roll_deg=roll_deg))
 
             if self.cut_lateral_radius > 0.0 and outcome.contacted:
-                followed, on_force = self._widening_pass(rotvec, outcome.depth_m)
+                with metrics.timer('widen'):
+                    followed, on_force = self._widening_pass(rotvec, outcome.depth_m)
                 self.get_logger().info(
                     f'eye {idx}: widening pass followed {followed} waypoints'
                     + (' (stopped on force)' if on_force else ''))
 
-            self.robot.move_to_pose(approach, rotvec)  # clear the surface
+            with metrics.timer('retract'):
+                self.robot.move_to_pose(approach, rotvec)  # clear the surface
             self.robot.drill_off()
 
         self.get_logger().info('drilling pass complete')
         self.get_logger().info(format_attempt_table(attempts))
+        metrics.attempts = attempts
+        self.get_logger().info(metrics.format_report())
+        self.get_logger().info(
+            '  localization is reported against a hand count of the eyes actually on '
+            'this potato; nothing in the pipeline can supply that, since a detector '
+            'cannot report what it failed to detect.')
         self.status_pub.publish(Bool(data=True))
 
 

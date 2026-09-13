@@ -64,6 +64,7 @@ from geometry_msgs.msg import Point, PointStamped
 from scipy.spatial.transform import Rotation as Rot
 
 from potato_scan.pose_utils import look_at_rotation, rotmat_to_rotvec, camera_pose_to_tcp_pose
+from potato_scan.run_metrics import PhaseTimer
 from potato_scan.scan_schedule import RasterOrbitSchedule
 from potato_scan.surface_coverage import SurfaceCoverageGrid
 from potato_scan.robot_interface import UR5eInterface
@@ -241,6 +242,11 @@ class ScanController(Node):
         self._last_direction = None
         self._views_taken = 0
         self._unreachable_views = 0
+        # Split by phase, because the two halves of the scan are paid for
+        # differently: the raster is a fixed cost every potato carries, while
+        # gap filling is what THIS potato's shape cost extra. A single total
+        # cannot tell a slow sweep from an awkward potato.
+        self.timer = PhaseTimer()
         self._done = False
         self.create_timer(0.5, self._run_step, callback_group=self._cb_group)
 
@@ -329,12 +335,15 @@ class ScanController(Node):
             cam_rot = look_at_rotation(cam_pos, self.potato_center, roll_deg=roll_deg)
             tcp_pos, tcp_rot = camera_pose_to_tcp_pose(
                 cam_pos, cam_rot, self.r_tcp_cam, self.t_tcp_cam)
-            if not self.robot.move_to_pose(tcp_pos, rotmat_to_rotvec(tcp_rot)):
+            with self.timer('move'):
+                reached = self.robot.move_to_pose(tcp_pos, rotmat_to_rotvec(tcp_rot))
+            if not reached:
                 continue
             if roll_deg:
                 self.get_logger().info(f'view reached via camera roll {roll_deg}deg')
             self._views_taken += 1
-            self._wait_for_cloud_to_settle()
+            with self.timer('settle'):
+                self._wait_for_cloud_to_settle()
             return True
 
         self._unreachable_views += 1
@@ -441,7 +450,8 @@ class ScanController(Node):
             self.get_logger().info(
                 f'raster view {self.raster.progress}: elevation={elevation_deg:.0f}deg '
                 f'azimuth={azimuth_deg:.0f}deg')
-            self._attempt_view(direction, self.scan_radius)
+            with self.timer('raster'):
+                self._attempt_view(direction, self.scan_radius)
             self._last_direction = direction
             return
 
@@ -460,7 +470,8 @@ class ScanController(Node):
                 return
             radius_scale = 1.0
 
-        ok = self._scan_with_recovery(e, a, direction, radius_scale)
+        with self.timer('gap-filling'):
+            ok = self._scan_with_recovery(e, a, direction, radius_scale)
         if not ok:
             self.coverage.mark_unscannable(e, a)
         self._last_direction = direction
@@ -487,6 +498,13 @@ class ScanController(Node):
                                  y=float(self.potato_center[1]),
                                  z=float(self.potato_center[2]))
         self.center_pub.publish(center_msg)
+
+        lines = ['scan cycle time:']
+        for phase in sorted(self.timer.totals, key=lambda p: -self.timer.totals[p]):
+            lines.append(f'  {phase:<12} {self.timer.totals[phase]:>7.2f}s '
+                         f'({self.timer.counts[phase]} x '
+                         f'{self.timer.mean(phase):.2f}s)')
+        self.get_logger().info('\n'.join(lines))
 
         self.complete_pub.publish(Bool(data=True))
         self.robot.stop()

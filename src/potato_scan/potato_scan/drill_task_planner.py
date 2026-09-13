@@ -316,3 +316,55 @@ def helical_cut_path(contact_position, tool_z_axis, depth, lateral_radius,
             + np.outer(depth * (1.0 - s), axis)
             + np.outer(radius * np.cos(angle), u)
             + np.outer(radius * np.sin(angle), v))
+
+
+# Puncture stress of raw potato flesh through the skin, derived from a
+# published penetration test: a 2 mm cylindrical probe driven 15 mm at
+# 1.5 mm/s peaked at 41.2-47.2 N across seasons on cv. Spunta. A 2 mm probe
+# presents pi * (1 mm)^2 = 3.14 mm^2, so that is 13.1-15.0 MPa; the lower
+# bound is used, being the conservative one for a part that must NOT
+# penetrate. Denser cultivars are tougher (a needle probe on cv. Kufri
+# Badshah peaked at 79 N), so a collar sized against the soft end is sized
+# against the worst case for its own job.
+POTATO_PUNCTURE_STRESS_PA = 13.1e6
+
+
+def depth_collar_spec(bit_diameter_m, max_depth_m, max_force_n,
+                      puncture_stress_pa=POTATO_PUNCTURE_STRESS_PA,
+                      safety_factor=4.0):
+    """Dimensions for a passive collar that bounds penetration mechanically.
+
+    Software decides how deep to go; this is the part that makes it true
+    anyway. The precedent is direct: the tissue-sampling robot this project
+    is closest to had its vision compute too deep a target in 17 of 81
+    trials, and the biopsy punch's hub -- simply wider than the blade --
+    stopped every one of them at the intended 7 mm. A mechanical ceiling
+    absorbed a software error, which is the whole design pattern, and the
+    same idea is standard as depth-limiting collars and stops on surgical
+    drills.
+
+    It composes particularly well with force control. The collar meeting the
+    skin is a sudden rise in contact force, so force_drill sees max_force and
+    stops cleanly. In a position-controlled cell the same contact instead
+    becomes a following error that accumulates over a run -- which is what
+    the tissue-sampling robot reported, and what this cell structurally does
+    not have.
+
+    Returns the offset of the collar face from the bit tip (equal to the
+    intended depth, so the face meets the skin exactly as the tip reaches
+    it), the smallest outer diameter that will not itself puncture at
+    max_force, and the pressure it would see there.
+    """
+    bit_area = 3.141592653589793 * (bit_diameter_m / 2.0) ** 2
+    allowed_pressure = puncture_stress_pa / safety_factor
+    required_area = max_force_n / allowed_pressure
+    outer_diameter = 2.0 * ((required_area + bit_area) / 3.141592653589793) ** 0.5
+
+    return {
+        'offset_from_tip_m': float(max_depth_m),
+        'min_outer_diameter_m': float(outer_diameter),
+        'contact_area_m2': float(required_area),
+        'pressure_at_max_force_pa': float(max_force_n / required_area),
+        'puncture_stress_pa': float(puncture_stress_pa),
+        'safety_factor': float(safety_factor),
+    }
