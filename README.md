@@ -160,6 +160,33 @@ driving the arm into a pin is perfectly reachable. A keep-out cone about
 `fixture_blocked`, which is a re-seat-the-potato problem rather than the
 force-tuning problem `unreachable` would suggest.
 
+## How many scan views does it need?
+
+```bash
+python -m potato_scan.scan_budget --potatoes 8
+```
+
+Sweeps the raster's step sizes against coverage on procedurally generated
+potatoes, using the same coverage grid the robot uses and a sampled
+visibility model (`potato_surface.py`) — no robot, no simulator, no GPU.
+
+**Twelve views reach full coverage on every potato tried; the shipped default
+is 40.** Nine reach 99.7%, six fall to 85.8%. The scan's cost is dominated by
+its view count, so that is a 3.3× reduction in the dominant term — but the
+model is *geometric*. No sensor noise, no specularity, no dropout in the dark
+pockets an eye actually is, no arm to refuse a pose. Every one of those argues
+for more views than the geometric minimum, so read 12 as the floor and the
+other 28 as a robustness margin worth choosing deliberately rather than
+inheriting from round numbers.
+
+The same sweep says something about the **Phase B / RL hook**: at 40 views
+the raster already saturates, so there is no gap left to fill and
+`rl/cpu_scan_env.py` has no problem to pose. That is structural — a
+star-shaped surface has essentially no self-occlusion once grazing views are
+discarded, and a dent is still star-shaped. The policy only has work below
+about nine views. Where it would actually earn its place on the real cell is
+on effects this model omits, not on geometry.
+
 ## Known gaps
 
 - **Nothing here has been run against a robot or a camera.** Every number is
