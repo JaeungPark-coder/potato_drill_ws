@@ -21,9 +21,11 @@ inside Isaac Sim itself) over plain ROS2 topics instead:
 
 force_drill here is a simplified approximation, NOT true admittance
 control: it steps the target pose along the insertion axis a small
-increment at a time and stops on max_force (from the simulated wrench)
-or max_depth, matching the real force_drill's external contract. It
-isn't compliant on the other 5 axes the way UR's real force_mode is --
+increment at a time, takes the first step whose simulated wrench passes
+contact_force as depth zero, and stops on max_force or max_depth past
+that point -- matching the real force_drill's external contract
+(including its DrillOutcome return). It isn't compliant on the other 5
+axes the way UR's real force_mode is --
 fine for validating the scan/detect/visit-order/roll-search pipeline in
 sim, not a substitute for tuning real insertion dynamics.
 """
@@ -36,6 +38,8 @@ from std_msgs.msg import Bool
 import tf2_ros
 from tf2_ros import TransformException
 from scipy.spatial.transform import Rotation as Rot
+
+from potato_scan.drill_task_planner import DrillOutcome
 
 
 class IsaacSimRobotInterface:
@@ -156,44 +160,71 @@ class IsaacSimRobotInterface:
     def drill_off(self):
         self.drill_state_pub.publish(Bool(data=False))
 
+    def tcp_force_magnitude(self):
+        """Magnitude of the simulated contact force, or None before any
+        wrench has arrived -- same contract as UR5eInterface's, except that
+        this one can legitimately not know yet."""
+        return self._current_force_mag()
+
     def force_drill(self, task_frame, axis_index=2, feed_force=15.0, max_force=40.0,
-                     max_depth=0.015, timeout_s=8.0, poll_dt=0.05,
+                     max_depth=0.008, timeout_s=8.0, poll_dt=0.05,
+                     contact_force=5.0, max_approach_travel=0.05,
                      free_axis_speed_limit=0.05, held_axis_deviation_limit=0.005,
                      step_size_m=0.0005):
-        """Feed along the negative direction of `axis_index` of
-        `task_frame` in small position steps, reading simulated contact
-        force each step. `feed_force`/`free_axis_speed_limit`/
-        `held_axis_deviation_limit` are accepted for interface
-        compatibility with UR5eInterface.force_drill (real force_mode
-        parameters) but unused here -- see module docstring on why this
-        is a simplified stand-in, not true admittance control.
+        """Feed along the POSITIVE direction of `axis_index` of `task_frame`
+        (the tool's +Z now points INTO the surface) in small position
+        steps, reading simulated contact force each step, and return a
+        DrillOutcome matching UR5eInterface.force_drill's contract --
+        including its two-phase structure: travel until the force first
+        passes `contact_force` (depth zero), then `max_depth` of
+        penetration past that point. `max_approach_travel` bounds the
+        first phase so a missing/blind contact sensor reports 'no_contact'
+        instead of silently feeding forever.
 
-        Returns True if max_depth was reached, False if stopped on
-        max_force.
+        `feed_force`/`free_axis_speed_limit`/`held_axis_deviation_limit`
+        are accepted for interface compatibility (real force_mode
+        parameters) but unused here -- see the module docstring on why
+        this is a simplified stand-in, not true admittance control.
         """
         base_pos = np.array(task_frame[:3], dtype=float)
         base_rotvec = np.array(task_frame[3:], dtype=float)
         base_rot_matrix = Rot.from_rotvec(base_rotvec).as_matrix()
-        insertion_axis = base_rot_matrix[:, axis_index]  # outward normal direction
+        insertion_axis = base_rot_matrix[:, axis_index]  # +Z: into the surface
 
+        travel = 0.0
+        contact_travel = None
         depth = 0.0
-        reached = False
+        peak_force = 0.0
+        status = 'timeout'
         t0 = time.time()
         while time.time() - t0 < timeout_s:
-            depth = min(depth + step_size_m, max_depth)
-            target_pos = base_pos - insertion_axis * depth  # feed INTO the surface
+            travel += step_size_m
+            target_pos = base_pos + insertion_axis * travel  # feed INTO the surface
             self._publish_target(target_pos, base_rotvec)
             time.sleep(poll_dt)
 
             force_mag = self._current_force_mag()
-            if force_mag is not None and force_mag >= max_force:
-                reached = False
-                break
-            if depth >= max_depth:
-                reached = True
-                break
+            if force_mag is not None:
+                peak_force = max(peak_force, force_mag)
 
-        return reached
+            if contact_travel is None:
+                if force_mag is not None and force_mag >= contact_force:
+                    contact_travel = travel
+                elif travel >= max_approach_travel:
+                    status = 'no_contact'
+                    break
+
+            if contact_travel is not None:
+                depth = travel - contact_travel
+                if depth >= max_depth:
+                    status = 'reached'
+                    break
+                if force_mag is not None and force_mag >= max_force:
+                    status = 'force_limit'
+                    break
+
+        return DrillOutcome(status=status, depth_m=depth, peak_force_n=peak_force,
+                            contacted=contact_travel is not None)
 
     def stop(self):
         pass  # no in-flight trajectory queue to cancel with a pose-target interface

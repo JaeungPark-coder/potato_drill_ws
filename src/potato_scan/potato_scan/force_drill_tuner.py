@@ -5,8 +5,10 @@ pipeline.
 
 Usage: freedrive the UR5e (this script enables teach mode) so the tool
 tip sits `standoff` back from a real potato surface, oriented with its
-+Z axis pointing OUT of the surface (same convention as
-eye_detector.normal_to_quat / drill_controller.normal_rotation). Press
++Z axis pointing INTO the surface -- i.e. the drill bit aimed at the
+potato, the same tool-frame convention drill_controller commands (see
+_find_reachable_approach: the perception-side normal is outward, the
+tool is built from -normal). Press
 Enter to run one probe with the current feed_force/max_force/max_depth
 from config/params.yaml's drill_controller block (reused here via the
 `force_drill_tuner` block so drill_controller's own tuning stays
@@ -34,12 +36,19 @@ class ForceDrillTuner(Node):
         self.declare_parameter('drill_output_pin', 0)
         self.declare_parameter('feed_force', 8.0)
         self.declare_parameter('max_force', 25.0)
-        self.declare_parameter('max_depth', 0.015)
+        self.declare_parameter('max_depth', 0.008)
+        self.declare_parameter('contact_force', 5.0)
+        self.declare_parameter('surface_position_tolerance', 0.02)
+        self.declare_parameter('standoff', 0.03)
         self.declare_parameter('drill_timeout_s', 8.0)
 
         self.feed_force = self.get_parameter('feed_force').value
         self.max_force = self.get_parameter('max_force').value
         self.max_depth = self.get_parameter('max_depth').value
+        self.contact_force = self.get_parameter('contact_force').value
+        self.max_approach_travel = (
+            self.get_parameter('standoff').value
+            + self.get_parameter('surface_position_tolerance').value)
         self.drill_timeout_s = self.get_parameter('drill_timeout_s').value
 
         self.robot = UR5eInterface(
@@ -56,21 +65,26 @@ class ForceDrillTuner(Node):
 
         self.robot.drill_on()
         try:
-            reached = self.robot.force_drill(
+            outcome = self.robot.force_drill(
                 task_frame, axis_index=2,
                 feed_force=self.feed_force, max_force=self.max_force,
-                max_depth=self.max_depth, timeout_s=self.drill_timeout_s)
+                max_depth=self.max_depth, timeout_s=self.drill_timeout_s,
+                contact_force=self.contact_force,
+                max_approach_travel=self.max_approach_travel)
         finally:
             self.robot.drill_off()
 
         end_pos, _ = self.robot.get_tcp_pose()
-        depth = float(np.linalg.norm(end_pos - pos))
-        force = self.robot.receive.getActualTCPForce()
-        force_mag = float(np.linalg.norm(force[:3]))
+        travel = float(np.linalg.norm(end_pos - pos))
 
-        outcome = 'reached max_depth' if reached else 'stopped on max_force'
+        # outcome.depth_m is penetration past the detected contact point;
+        # `travel` is the whole move including closing the standoff gap.
+        # They differ by roughly the standoff, and it is the first that
+        # max_depth is about.
         self.get_logger().info(
-            f'result: {outcome} -- depth={depth * 1000:.2f}mm force={force_mag:.1f}N')
+            f'result: {outcome.status} -- penetration={outcome.depth_m * 1000:.2f}mm '
+            f'total_travel={travel * 1000:.2f}mm peak_force={outcome.peak_force_n:.1f}N '
+            f'contacted={outcome.contacted}')
 
         # retract back to the pre-probe pose
         self.robot.move_to_pose(pos, rotvec)

@@ -16,6 +16,25 @@
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>rviz2</exec_depend>
 
+  <!-- Computational dependencies the nodes import directly. Without these a
+       fresh machine builds fine and then dies at node startup on ImportError. -->
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <!-- No rosdep keys exist for these; install with pip into the same
+       interpreter that runs the nodes.
+         open3d   : pointcloud_accumulator only, since eye_detector moved to
+                    potato_scan/surface_curvature.py (numpy + scipy). No wheel
+                    for Python 3.13+, so the accumulator still needs 3.12 or
+                    older; everything else now runs anywhere.
+         ur-rtde  : robot_interface (rtde_control / rtde_receive / rtde_io),
+                    only for robot_backend:=rtde
+         gymnasium, stable-baselines3 : only for the rl policies
+                    (view_policy / approach_policy set to rl)
+  -->
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
