@@ -7,6 +7,65 @@ eyes, and drill them out.
 scan (raster orbit + gap filling)  ->  detect (curvature + shape + colour)  ->  drill (force-fed, per eye)
 ```
 
+## Environment
+
+Nothing in this repository has been run against a robot or a camera. Every
+number in it comes from synthetic data, analytic surfaces or stubbed
+backends. This section is what to install and what to check so that the first
+run on real hardware fails for real reasons rather than for setup ones.
+
+### What you need
+
+| | why |
+|---|---|
+| ROS 2 (Humble or newer) | the four pipeline nodes |
+| **Python 3.12 or older** | Open3D publishes no wheel for 3.13+, and `pointcloud_accumulator` needs it |
+| RealSense (or equivalent) ROS driver | publishes `/camera/depth/color/points` |
+| `ur_rtde` | only for `robot_backend:=rtde`; the Isaac backend does not need it |
+
+The Python version is the trap. Everything else in the package runs on any
+recent Python — only the accumulator imports Open3D — so a 3.13+ environment
+gets you a package that builds, imports most of the way, and dies on one
+node.
+
+### Install and build
+
+```bash
+# ROS-resolvable dependencies (numpy, scipy, opencv, yaml, the message packages)
+rosdep install --from-paths src --ignore-src -y
+
+# the two with no rosdep key
+pip install open3d          # pointcloud_accumulator; needs Python <= 3.12
+pip install ur-rtde         # only for robot_backend:=rtde
+
+# optional, only if you intend to train the view policy
+pip install gymnasium stable-baselines3
+
+colcon build --symlink-install && source install/setup.bash
+```
+
+### Check it before you plug anything in
+
+Most of this package is plain numpy and scipy and can be exercised with no
+ROS, no robot and no camera — which is worth doing first, because it
+separates "my install is wrong" from "my hardware is wrong":
+
+```bash
+cd src/potato_scan
+
+# the view-budget sweep: runs the real coverage grid against simulated potatoes
+python -m potato_scan.scan_budget --potatoes 5
+
+# is the camera even usable at the configured distance?
+python -c "
+from potato_scan.camera_ranges import check
+print(check('d435', 0.15, 0.07)[1])"
+```
+
+If those run, the geometry half of the package is working and anything that
+breaks later is ROS, hardware, or calibration.
+
+
 ## Bring-up order
 
 The order matters. Each step's output is the next step's input, and a wrong
@@ -135,6 +194,89 @@ comparable to anything:
 For a run worth publishing: a fixed *n* ≥ 30 potatoes, the success criterion
 stated up front, phase timings recorded automatically, success and damage
 recorded by hand.
+
+## What is still unverified, and what verifies it
+
+Ordered so that each step's failure is cheap and interpretable. Do not skip
+ahead: a wrong answer early does not stop the pipeline, it makes the next
+step produce plausible nonsense.
+
+| # | what | needs | how you know it worked |
+|---|---|---|---|
+| 1 | Camera minimum range | the model number | `camera range:` line at scan startup is `info`, not `error` |
+| 2 | Hand-eye calibration | board + robot | reprojection residual printed by the tool; then step 4's number |
+| 3 | Scan geometry | robot + camera | coverage reaches threshold without a pile of `unreachable` warnings |
+| 4 | Detection thresholds | real scans | eye count lands in 2–15, κ threshold above the 90th percentile |
+| 5 | **Position accuracy** | robot + callipers | `calliper_check` mean under ~2 mm |
+| 6 | Force limits | robot + potatoes | `force_drill_tuner` reaches depth without tripping `max_force` |
+| 7 | Depth collar | 3D printer | insertion stops on `max_force` when the collar meets skin |
+| 8 | End-to-end rates | ≥30 potatoes | `run_metrics` report with ground truth supplied |
+
+Steps 1 and 8 bracket everything: 1 costs nothing and invalidates the rest if
+wrong, and 8 is the only thing that produces numbers comparable to published
+systems.
+
+**Step 5 is the one to get to quickly.** It runs with the drill off, so
+nothing is destroyed and the same potato can be measured again after every
+change — which turns steps 2–4 from guesswork into a loop with a number at
+the end of it.
+
+
+## When something goes wrong
+
+Messages below are quoted as the nodes actually print them.
+
+### Build and startup
+
+| you see | it means | do |
+|---|---|---|
+| `ModuleNotFoundError: open3d` | Python 3.13+, or Open3D not installed | `python -V`; if 3.13+, build the workspace against 3.12 or older |
+| `ModuleNotFoundError: rtde_control` | `ur_rtde` missing | `pip install ur-rtde`, or use `robot_backend:=isaac_sim` |
+| node dies immediately on `import numpy`/`scipy` | `rosdep install` not run | run it; `package.xml` declares them |
+
+### Scanning
+
+| you see | it means | do |
+|---|---|---|
+| `camera range: ... cannot focus this close` | the camera's minimum exceeds the distance to the potato's **surface** | change `camera_model` if it was wrong, else raise `scan_radius` to the value the message names, or fit a close-range camera |
+| `camera range: ... is not in the table` | unknown model — **not** a pass | look up its minimum at your working resolution and compare against the distance in the message |
+| `the camera topic carries no rgb field` | subscribed to a depth-only topic | point `camera_topic` at `/camera/depth/color/points` |
+| many `view direction=... unreachable at every camera roll` | the orbit is outside the arm's envelope | check `potato_center` against where the potato actually is, and `scan_radius` against the workspace |
+| `cell (e,a) still empty after N recovery attempts` | persistent occlusion at that direction | expected for a few cells near the fixture; a lot of them means the fixture or gripper is in the way |
+| `potato_center fit landed Nmm from the configured ...` | the sphere fit latched onto fixture or background | fix the configured `potato_center`; the fit refines, it does not search |
+| coverage stalls well short of threshold | too few views, or the camera is marginal | run `scan_budget` with your `--scan-radius`; if the geometry says it should cover, suspect the camera |
+
+### Detection
+
+| you see | it means | do |
+|---|---|---|
+| `curvature_min=... sits below this scan's 90th percentile` | the threshold is set for a different point density | raise it toward the p99 the same line prints |
+| `N eyes is outside the 2-15 a potato plausibly has` | thresholds wrong for this scan, not an unusual potato | check the percentile line above it first |
+| `merged cloud has no colour` | the accumulator got a depth-only topic | see the `rgb` row above |
+| plausible eye count, wrong places | soil clods read as pits — geometry cannot separate them | look at the logged `colour_contrast`; if eyes and clods separate, set `min_color_contrast` between them |
+| `not enough points for eye detection` | the scan produced almost nothing | a scanning problem, not a detection one |
+
+### Drilling
+
+| you see | it means | do |
+|---|---|---|
+| `eye N: no_contact -- skipping` | fed the whole approach travel touching nothing | the eye pose or `potato_center` is wrong, **or the potato moved**. Not a force-tuning problem — raising `feed_force` cannot help |
+| `eye N: force_limit` | hit `max_force` before depth | `max_force: 40.0` sits at a soft cultivar's puncture peak; dense ones need 60–90 N. Check the bit is sharp before raising it |
+| `eye N: fixture_blocked` | every approach starts inside the pin's keep-out cone | re-seat the potato so that eye faces out. Widening the cone does not fix it, it just lets the arm hit the pin |
+| `eye N: unreachable` | the arm refused every roll **and** tilt | a kinematics problem: check fixture placement, and whether `max_approach_tilt_deg` is larger than 0 |
+| `reached` but nothing was removed | depth or cut shape | `max_depth` is 8 mm from **contact**; if the hole is right but the eye stays, try `cut_lateral_radius` |
+| `widening pass: ... reached max_force` | the cut bound up | expected on a wide `cut_lateral_radius`; the bore is still cut, so it is a warning, not a failure |
+
+### The one that hides
+
+A run that finishes cleanly and reports success is still worth doubting until
+step 5 has given you a number. Every expensive failure this project has had
+looked exactly like a clean run: a well-formed dataset in which the target
+never appeared, a drill that reported reaching depth while 15 mm clear of the
+potato, a wrist driven through the potato's own volume. The guards that now
+catch those are in the code, but the calliper number is what confirms the
+whole chain rather than each link.
+
 
 ## Choices worth knowing about
 
