@@ -243,7 +243,7 @@ def describe_surface(points, potato_center, knn=30):
 def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
                         shape_index_max=0.35, cluster_eps=0.003,
                         cluster_min_points=8, min_diameter=0.002,
-                        max_diameter=0.015):
+                        max_diameter=0.015, colors=None, min_color_contrast=None):
     """The whole point-cloud half of eye detection, with no ROS in it.
 
     Selects points that are both curved enough (kappa) and cup-shaped (S),
@@ -277,6 +277,18 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
     a starting point and check the logged percentiles on a real scan.
     shape_index_max needs no such tuning: 0.35 keeps cups and ruts and
     rejects saddles, ridges and domes at any scale.
+
+    `colors` adds a third axis the geometry cannot supply. Curvature and
+    shape index together describe a pit, and a clod of soil sitting in or
+    forming a hollow IS a pit -- no amount of geometry separates them,
+    which is the known ceiling on a geometry-only detector. Every candidate
+    therefore carries `color_contrast`, how much darker it is than the
+    surface immediately around it, and `min_color_contrast` turns that into
+    a filter. Left at None the colour is measured and reported but nothing
+    is rejected on it, which is the right default until the number has been
+    looked at on real potatoes: the visible band is a weak tuber-vs-soil
+    discriminator on its own, reliable on wet material and doubtful when
+    dry, so it belongs as evidence before it belongs as a gate.
     """
     points = np.asarray(points, dtype=float)
     if len(points) < knn + 1:
@@ -287,6 +299,7 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
     if not np.any(selected):
         return []
 
+    selected_index = np.flatnonzero(selected)
     candidate_points = points[selected]
     labels = dbscan(candidate_points, cluster_eps, cluster_min_points)
 
@@ -297,12 +310,25 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
         diameter = float(np.linalg.norm(cluster.max(axis=0) - cluster.min(axis=0)))
         if not (min_diameter <= diameter <= max_diameter):
             continue
+
+        color_contrast, n_surround = 0.0, 0
+        if colors is not None:
+            # the annulus has to be found in the FULL cloud: the surround is
+            # exactly the surface that was NOT selected as cup-shaped
+            full_member = np.zeros(len(points), dtype=bool)
+            full_member[selected_index[member]] = True
+            color_contrast, n_surround = surround_contrast(points, colors, full_member)
+            if min_color_contrast is not None and color_contrast < min_color_contrast:
+                continue
+
         normal = normals[selected][member].mean(axis=0)
         normal /= np.linalg.norm(normal)
         candidates.append({
             'position': cluster.mean(axis=0),
             'normal': normal,
             'diameter': diameter,
+            'color_contrast': float(color_contrast),
+            'surround_points': int(n_surround),
             # how cup-like the cluster is on average -- lower is more of a
             # pit, and it is the natural ranking when more candidates come
             # back than a potato plausibly has eyes
@@ -312,3 +338,50 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
 
     candidates.sort(key=lambda c: c['shape_index'])
     return candidates
+
+
+# --- colour, as a third axis on top of the two geometric ones -------------
+
+def luminance(colors):
+    """Perceived brightness of each RGB row, on whatever scale the input
+    uses (0-1 or 0-255 both work, since every use here is a ratio)."""
+    rgb = np.asarray(colors, dtype=float)
+    return rgb @ np.array([0.2126, 0.7152, 0.0722])
+
+
+def surround_contrast(points, colors, member_mask, inner_scale=1.5,
+                      outer_scale=3.0):
+    """How much darker a candidate is than the surface immediately around it.
+
+    Returns (contrast, n_surround). Contrast is
+    (surround_luma - candidate_luma) / surround_luma: positive when the
+    candidate is darker, and a ratio rather than an absolute level, so it
+    does not move with exposure, lighting or skin tone the way a fixed
+    RGB threshold does. That matters here because the visible band is
+    known to be a weak tuber-vs-soil discriminator on its own -- it works
+    on wet material and is doubtful when dry -- so the gate built on it
+    should at least not also be fragile to illumination.
+
+    The surround is an annulus around the candidate rather than the whole
+    cloud: a potato eye is darker than the skin BESIDE it, which is a
+    local statement, and comparing against a global mean would instead be
+    asking whether the whole potato is dark.
+    """
+    points = np.asarray(points, dtype=float)
+    member = np.asarray(member_mask, dtype=bool)
+    cluster = points[member]
+    center = cluster.mean(axis=0)
+    radius = float(np.max(np.linalg.norm(cluster - center, axis=1)))
+    if radius <= 0.0:
+        return 0.0, 0
+
+    distance = np.linalg.norm(points - center, axis=1)
+    annulus = (~member) & (distance > inner_scale * radius) & (distance <= outer_scale * radius)
+    if not np.any(annulus):
+        return 0.0, 0
+
+    candidate_luma = float(np.median(luminance(np.asarray(colors)[member])))
+    surround_luma = float(np.median(luminance(np.asarray(colors)[annulus])))
+    if surround_luma <= 1e-9:
+        return 0.0, int(annulus.sum())
+    return (surround_luma - candidate_luma) / surround_luma, int(annulus.sum())

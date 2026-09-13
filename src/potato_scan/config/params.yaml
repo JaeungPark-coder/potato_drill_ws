@@ -121,6 +121,15 @@ eye_detector:
     # invariant, so unlike curvature_min this should not need tuning. Curvature
     # alone cannot tell a pit from the ridge beside it; this is what does.
     shape_index_max: 0.35
+    # How much darker than the surrounding skin a candidate must be, as a
+    # fraction of the surround's brightness. Curvature and shape index
+    # describe a pit, and a clod of soil in a hollow is also a pit -- colour
+    # is the only axis that separates them, and the camera is already
+    # publishing it. Negative measures and logs the contrast without
+    # rejecting anything, which is the default until the number has been
+    # seen on real potatoes. On a synthetic where clods share the eyes'
+    # geometry exactly, eyes came out near +0.55 and clods near +0.02.
+    min_color_contrast: -1.0
     cluster_eps: 0.003
     cluster_min_points: 8
     min_eye_diameter: 0.002

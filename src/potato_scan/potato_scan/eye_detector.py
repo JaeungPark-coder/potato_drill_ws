@@ -20,6 +20,8 @@ curvature is known. In outline:
      scale-invariant "which way curved" -- 0 is a cup, 1 is a dome.
   3. Keep points that are both curved enough AND cup-shaped, cluster
      them, and keep clusters the size of an eye.
+  4. Measure how much darker each surviving cluster is than the skin
+     immediately around it, and optionally reject on that.
 
 The two-axis test replaced a single score -- the offset of each point's
 neighbourhood centroid along its own normal, in metres. That score could
@@ -30,9 +32,17 @@ what rejects non-eyes and the shape index is what localises them: without
 the latter the position error grows from 0.7 mm to 2.4 mm, without the
 former 9 of 10 candidates are false.
 
-Swap in a learned keypoint/segmentation model later if precision on real
-potatoes is still insufficient -- the geometry here does not use colour,
-so mud and surface damage remain the obvious confusers.
+Step 4 exists because the geometry has a ceiling it cannot lift on its own:
+a clod of soil sitting in a hollow IS a pit, with the same curvature and the
+same shape index as an eye. Colour is the only axis that separates them, and
+it is already arriving -- the camera publishes a coloured cloud and it was
+being discarded. The contrast is measured relative to the surrounding
+surface rather than as an absolute colour, since that survives changes in
+lighting and skin tone, and it is reported but not enforced by default: the
+visible band alone is a known-weak tuber-vs-soil discriminator, good on wet
+material and doubtful when dry, so it earns a place as evidence before it
+earns one as a gate. A learned keypoint/segmentation model, or a near-
+infrared band, is the step beyond that if soil remains a problem.
 """
 import numpy as np
 import rclpy
@@ -44,6 +54,7 @@ from geometry_msgs.msg import PoseArray, Pose, Point, PointStamped
 from visualization_msgs.msg import Marker, MarkerArray
 from scipy.spatial.transform import Rotation as Rot
 
+from potato_scan.cloud_rgb import unpack_rgb
 from potato_scan.surface_curvature import describe_surface, find_eye_candidates
 
 # A potato carries roughly 5-10 eyes. Counts far outside that say the
@@ -85,6 +96,15 @@ class EyeDetector(Node):
         # (0.5), ridges (0.75) and domes (1.0). Scale-invariant, so unlike
         # curvature_min this should not need per-setup tuning.
         self.declare_parameter('shape_index_max', 0.35)
+        # How much darker than the surrounding skin a candidate must be.
+        # Curvature and shape index describe a pit, and a clod of soil in a
+        # hollow is also a pit -- colour is the only axis that separates
+        # them. Negative disables the gate, measuring and reporting the
+        # contrast without rejecting anything, which is the right default
+        # until the number has been seen on real potatoes: the visible band
+        # is a weak tuber-vs-soil discriminator by itself, good on wet
+        # material and doubtful when dry.
+        self.declare_parameter('min_color_contrast', -1.0)
         self.declare_parameter('cluster_eps', 0.003)
         self.declare_parameter('cluster_min_points', 8)
         self.declare_parameter('min_eye_diameter', 0.002)
@@ -95,6 +115,8 @@ class EyeDetector(Node):
         self.knn = self.get_parameter('knn').value
         self.curvature_min = self.get_parameter('curvature_min').value
         self.shape_index_max = self.get_parameter('shape_index_max').value
+        min_contrast = self.get_parameter('min_color_contrast').value
+        self.min_color_contrast = None if min_contrast < 0.0 else min_contrast
         self.cluster_eps = self.get_parameter('cluster_eps').value
         self.cluster_min_points = self.get_parameter('cluster_min_points').value
         self.min_eye_diameter = self.get_parameter('min_eye_diameter').value
@@ -151,11 +173,19 @@ class EyeDetector(Node):
                 f'scan density than this one')
 
     def detect_and_publish(self, cloud_msg: PointCloud2):
-        pts = np.array(list(pc2.read_points(
-            cloud_msg, field_names=('x', 'y', 'z'), skip_nans=True)))
-        if len(pts) < self.knn + 1:
+        has_rgb = any(f.name == 'rgb' for f in cloud_msg.fields)
+        fields = ('x', 'y', 'z', 'rgb') if has_rgb else ('x', 'y', 'z')
+        raw = np.array(list(pc2.read_points(
+            cloud_msg, field_names=fields, skip_nans=True)))
+        if len(raw) < self.knn + 1:
             self.get_logger().warn('not enough points for eye detection')
             return
+        pts = raw[:, :3]
+        colors = unpack_rgb(raw[:, 3]) if has_rgb else None
+        if colors is None:
+            self.get_logger().warn(
+                'merged cloud has no colour, so detection is geometry-only and a soil '
+                'clod in a hollow is indistinguishable from an eye')
 
         self._log_distributions(pts)
 
@@ -166,7 +196,8 @@ class EyeDetector(Node):
             cluster_eps=self.cluster_eps,
             cluster_min_points=self.cluster_min_points,
             min_diameter=self.min_eye_diameter,
-            max_diameter=self.max_eye_diameter)
+            max_diameter=self.max_eye_diameter,
+            colors=colors, min_color_contrast=self.min_color_contrast)
 
         eyes = [(c['position'], c['normal'], c['diameter']) for c in candidates]
         self.get_logger().info(f'detected {len(eyes)} potato eyes')
@@ -174,7 +205,10 @@ class EyeDetector(Node):
             self.get_logger().info(
                 f"  #{i} at {np.round(c['position'], 4)} diameter "
                 f"{c['diameter'] * 1000:.1f}mm shape_index {c['shape_index']:.3f} "
-                f"({c['points']} points)")
+                f"({c['points']} points)"
+                + ('' if colors is None else
+                   f" colour_contrast {c['color_contrast']:+.3f} "
+                   f"(vs {c['surround_points']} surround pts)"))
 
         low, high = PLAUSIBLE_EYE_COUNT
         if eyes and not (low <= len(eyes) <= high):

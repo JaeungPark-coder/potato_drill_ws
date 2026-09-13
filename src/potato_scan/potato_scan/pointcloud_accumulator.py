@@ -26,13 +26,28 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import PointCloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header, Int32
 import tf2_ros
 from tf2_ros import TransformException
 from scipy.spatial.transform import Rotation as Rot
 import open3d as o3d
+
+from potato_scan.cloud_rgb import pack_rgb, unpack_rgb
+
+
+# The camera topic this subscribes to (/camera/depth/color/points) is the
+# COLOURED cloud, so rgb is already arriving; it was simply being dropped by
+# asking read_points for x, y and z only. eye_detector needs it: curvature and
+# shape index describe a pit, and a clod of soil in a hollow is also a pit, so
+# geometry alone has no way to separate them.
+RGB_FIELDS = [
+    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    PointField(name='rgb', offset=12, datatype=PointField.FLOAT32, count=1),
+]
 
 
 def transform_to_matrix(t):
@@ -74,6 +89,7 @@ class PointCloudAccumulator(Node):
         self.count_pub = self.create_publisher(Int32, '/potato_scan/point_count', 10)
 
         self.merged = o3d.geometry.PointCloud()
+        self._warned_no_rgb = False
 
         self.create_timer(1.0, self.publish_status)
 
@@ -85,10 +101,19 @@ class PointCloudAccumulator(Node):
             self.get_logger().warn(f'TF lookup failed: {ex}', throttle_duration_sec=2.0)
             return
 
-        points = np.array(list(pc2.read_points(
-            msg, field_names=('x', 'y', 'z'), skip_nans=True)))
-        if points.size == 0:
+        has_rgb = any(f.name == 'rgb' for f in msg.fields)
+        fields = ('x', 'y', 'z', 'rgb') if has_rgb else ('x', 'y', 'z')
+        raw = np.array(list(pc2.read_points(msg, field_names=fields, skip_nans=True)))
+        if raw.size == 0:
             return
+        points = raw[:, :3]
+        colors = unpack_rgb(raw[:, 3]) if has_rgb else None
+        if not has_rgb and not self._warned_no_rgb:
+            self._warned_no_rgb = True
+            self.get_logger().warn(
+                'the camera topic carries no rgb field, so eye_detector gets geometry '
+                'only and cannot tell a soil clod in a hollow from an eye. The coloured '
+                'RealSense topic is /camera/depth/color/points.')
 
         mat = transform_to_matrix(tf)
         pts_h = np.hstack([points, np.ones((points.shape[0], 1))])
@@ -96,6 +121,10 @@ class PointCloudAccumulator(Node):
 
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(pts_base)
+        if colors is not None:
+            # carried through the merge and the voxel grid, which averages
+            # colour over each voxel the same way it averages position
+            cloud.colors = o3d.utility.Vector3dVector(colors)
         cloud = self._remove_outliers(cloud)
         self.merged += cloud
         self.merged = self.merged.voxel_down_sample(self.voxel_size)
@@ -130,7 +159,12 @@ class PointCloudAccumulator(Node):
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
         header.frame_id = self.base_frame
-        msg = pc2.create_cloud_xyz32(header, pts)
+        if self.merged.has_colors():
+            packed = pack_rgb(np.asarray(self.merged.colors))
+            rows = [(*point, color) for point, color in zip(pts, packed)]
+            msg = pc2.create_cloud(header, RGB_FIELDS, rows)
+        else:
+            msg = pc2.create_cloud_xyz32(header, pts)
         self.cloud_pub.publish(msg)
 
     def save(self, path):
