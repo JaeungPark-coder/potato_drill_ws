@@ -5,18 +5,21 @@ Deliberately has NO Isaac Sim / rclpy imports -- loaded both by the
 Isaac-side training env (isaac/rl_drill_train_env.py) and by the ROS2
 inference wrapper (rl/drill_policy_backend.py, used from drill_controller.py).
 
-The policy replaces drill_controller.ROLL_SEARCH_DEG's fixed roll sweep with
-a learned choice of (roll, small lateral offset) around the nominal
-normal-aligned approach pose -- same +Z-is-outward-normal convention as
-eye_detector.normal_to_quat / drill_controller.normal_rotation, reimplemented
-here (not imported from drill_controller.py) to avoid a circular import
-(drill_controller -> rl.drill_policy_backend -> this module).
+The policy replaces drill_task_planner.ROLL_SEARCH_DEG's fixed roll sweep
+with a learned choice of (roll, small lateral offset) around the nominal
+normal-aligned approach pose -- the same +Z-is-outward-normal convention as
+eye_detector.normal_to_quat, imported from drill_task_planner rather than
+copied. It used to be copied, to break a circular import through
+drill_controller; the convention has since moved into drill_task_planner,
+which imports nothing from this package, so the copy was removable -- and
+worth removing, because two identical copies of a rotation convention are
+two copies that can drift apart without any test noticing.
 """
 import numpy as np
 from gymnasium import spaces
 from scipy.spatial.transform import Rotation as Rot
 
-from ..drill_task_planner import approach_pose
+from ..drill_task_planner import approach_pose, normal_rotation
 
 # Lateral offset action maps into +/- this many meters, in the tangent plane
 # of the approach -- small enough to stay "the same eye", large enough to
@@ -52,24 +55,12 @@ def decode_action(action):
     return roll_deg, lateral_xy
 
 
-def normal_rotation(normal):
-    """Rotation matrix whose +Z axis is `normal` -- must match
-    eye_detector.normal_to_quat / drill_controller.normal_rotation exactly,
-    so approach orientations line up with the rest of the pipeline."""
-    z = np.asarray(normal, dtype=float)
-    z = z / np.linalg.norm(z)
-    ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-    x = np.cross(ref, z)
-    x = x / np.linalg.norm(x)
-    y = np.cross(z, x)
-    return np.column_stack((x, y, z))
-
-
 def compose_approach_pose(position, normal, standoff, roll_deg, lateral_xy):
     """Nominal standoff point along `normal` (drill_task_planner.approach_pose),
     nudged by `lateral_xy` in the approach's own tangent plane, with `roll_deg`
     applied about the insertion axis -- same roll convention
-    drill_controller._find_reachable_approach uses. Returns
+    drill_controller._find_reachable_approach uses, from
+    drill_task_planner.ROLL_SEARCH_DEG. Returns
     (approach_position (3,), rotvec (3,))."""
     # The tool frame points INTO the surface (+Z = -normal), while the
     # approach POSITION stays standoff metres out along the outward normal.

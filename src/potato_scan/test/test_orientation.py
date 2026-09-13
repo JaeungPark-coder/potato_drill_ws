@@ -91,3 +91,19 @@ def test_the_old_convention_really_was_backwards():
     clearance = distance_to_segment(POTATO_CENTER, approach, old_wrist)
     assert clearance < POTATO_RADIUS, \
         'the old convention no longer drives the tool through the potato'
+
+
+def test_the_perception_and_tool_conventions_are_exact_opposites():
+    """normal_rotation is now the single definition of this convention --
+    eye_detector's normal_to_quat and the drill's approach search both build
+    on it rather than on copies. What they must agree on is the sign: the
+    perception frame's +Z is the outward normal, the tool's +Z points the
+    other way, into the surface.
+    """
+    for normal in NORMALS:
+        normal = unit(normal)
+        perception_z = normal_rotation(normal)[:, 2]
+        tool_z = normal_rotation(-normal)[:, 2]
+
+        assert np.allclose(perception_z, normal, atol=1e-12)
+        assert np.allclose(tool_z, -perception_z, atol=1e-12)

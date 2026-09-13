@@ -65,7 +65,7 @@ class UR5eInterface:
         with `feed_force` newtons and return a DrillOutcome.
 
         Positive, because the tool frame's +Z now points INTO the surface
-        (drill_controller.normal_rotation builds it from -normal, matching
+        (drill_task_planner builds it from -normal, matching
         rl.drill_policy_spec.compose_approach_pose) -- the drill bit
         extends along the tool's +Z, so that is the direction it cuts.
 

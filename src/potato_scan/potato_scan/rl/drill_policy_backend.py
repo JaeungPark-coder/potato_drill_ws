@@ -2,7 +2,7 @@
 
 Loads a stable_baselines3 PPO checkpoint (trained via
 isaac/train_drill_policy.py) and exposes find_approach(...), a drop-in
-replacement for drill_controller._find_reachable_approach's ROLL_SEARCH_DEG
+replacement for the ROLL_SEARCH_DEG sweep drill_controller._find_reachable_approach
 sweep -- see the `approach_policy` parameter there.
 """
 from . import drill_policy_spec

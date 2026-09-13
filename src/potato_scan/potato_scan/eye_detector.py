@@ -55,6 +55,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from scipy.spatial.transform import Rotation as Rot
 
 from potato_scan.cloud_rgb import unpack_rgb
+from potato_scan.drill_task_planner import normal_rotation
 from potato_scan.surface_curvature import describe_surface, find_eye_candidates
 
 # A potato carries roughly 5-10 eyes. Counts far outside that say the
@@ -64,18 +65,15 @@ PLAUSIBLE_EYE_COUNT = (2, 15)
 
 
 def normal_to_quat(normal):
-    """Quaternion whose local +Z axis aligns with `normal` -- the
-    perception-side convention shared with drill_controller.normal_rotation
-    (which then builds the TOOL frame from -normal, so the bit points into
-    the surface)."""
-    z = np.asarray(normal, dtype=float)
-    z = z / np.linalg.norm(z)
-    ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-    x = np.cross(ref, z)
-    x = x / np.linalg.norm(x)
-    y = np.cross(z, x)
-    rot = np.column_stack((x, y, z))
-    return Rot.from_matrix(rot).as_quat()  # x, y, z, w
+    """Quaternion whose local +Z axis aligns with `normal`.
+
+    The rotation itself comes from drill_task_planner rather than being
+    rebuilt here: this is the perception side of a convention the drill side
+    also depends on (it builds the TOOL frame from -normal, so the bit points
+    into the surface), and two copies of it could drift apart while every
+    test still passed.
+    """
+    return Rot.from_matrix(normal_rotation(normal)).as_quat()  # x, y, z, w
 
 
 class EyeDetector(Node):

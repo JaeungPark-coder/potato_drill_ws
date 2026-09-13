@@ -75,7 +75,7 @@ from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 # view pose is rejected as unreachable. Rolling the camera about its own
 # optical axis spins the IMAGE without changing which surface patch is in
 # frame, so roll is a free parameter -- the same spare-DOF trick
-# drill_controller.ROLL_SEARCH_DEG uses for the rotationally symmetric bit.
+# drill_task_planner.ROLL_SEARCH_DEG uses for the rotationally symmetric bit.
 # Smallest deviation from level first, then wider swings.
 CAMERA_ROLL_SEARCH_DEG = [0, 45, -45, 90, -90, 135, -135, 180]
 
