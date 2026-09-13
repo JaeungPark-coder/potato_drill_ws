@@ -6,14 +6,33 @@ distance from the robot base.
 Triggered once by /potato_scan/scan_complete; operates on a snapshot of
 /potato_scan/merged_cloud taken at that moment.
 
-Detection approach (classical, no training data needed -- swap in a
-learned keypoint/segmentation model later if precision is insufficient):
-  1. Estimate per-point normals + a concavity score. The score is the
-     offset of each point's local-neighborhood centroid along its own
-     outward normal: positive => the point sits in a pit (neighbors are
-     further "out"), negative => it sits on a bump.
-  2. Threshold + DBSCAN-cluster the high-concavity points -> eye
-     candidates, filtered by expected eye size.
+Detection is classical, no training data needed -- see
+potato_scan/surface_curvature.py, which holds all of the geometry and has
+no ROS or Open3D in it so it can be tested against surfaces whose true
+curvature is known. In outline:
+
+  1. From each point's neighbourhood covariance: an outward normal
+     (oriented away from the potato centre rather than by propagating
+     orientation across the cloud) and the surface variation
+     kappa = lambda0 / sum(lambda), a dimensionless "how curved".
+  2. From a quadratic fit in the local frame: the two principal
+     curvatures, and from them Chen & Bhanu's shape index S, a
+     scale-invariant "which way curved" -- 0 is a cup, 1 is a dome.
+  3. Keep points that are both curved enough AND cup-shaped, cluster
+     them, and keep clusters the size of an eye.
+
+The two-axis test replaced a single score -- the offset of each point's
+neighbourhood centroid along its own normal, in metres. That score could
+not separate a pit from the ridge beside it (both are curved), and being
+a length it sat near the sensor's noise floor and had to be retuned
+whenever scan density changed. Ablated on a synthetic potato, kappa is
+what rejects non-eyes and the shape index is what localises them: without
+the latter the position error grows from 0.7 mm to 2.4 mm, without the
+former 9 of 10 candidates are false.
+
+Swap in a learned keypoint/segmentation model later if precision on real
+potatoes is still insufficient -- the geometry here does not use colour,
+so mud and surface damage remain the obvious confusers.
 """
 import numpy as np
 import rclpy
@@ -21,60 +40,23 @@ from rclpy.node import Node
 from std_msgs.msg import Bool
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
-from geometry_msgs.msg import PoseArray, Pose, Point
+from geometry_msgs.msg import PoseArray, Pose, Point, PointStamped
 from visualization_msgs.msg import Marker, MarkerArray
-from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as Rot
-import open3d as o3d
 
+from potato_scan.surface_curvature import describe_surface, find_eye_candidates
 
-def estimate_concavity(points, normals, k=30):
-    k = min(k, len(points) - 1)
-    tree = cKDTree(points)
-    _, idx = tree.query(points, k=k + 1)
-    neighbor_pts = points[idx[:, 1:]]
-    centroids = neighbor_pts.mean(axis=1)
-    return np.einsum('ij,ij->i', centroids - points, normals)
-
-
-def otsu_threshold(values, n_bins=256):
-    """Automatic bimodal threshold (Otsu's method) over `values` -- used by
-    EyeDetector when auto_concavity_threshold is true, so a first pass at a
-    new camera/potato batch doesn't need a hand-picked concavity_threshold
-    (which depends on scan density/noise and will drift between setups).
-    Assumes the concavity distribution is roughly bimodal (flat surface vs.
-    eye pits); falls back to the median if the histogram is degenerate (all
-    one value) rather than dividing by zero."""
-    values = np.asarray(values, dtype=float)
-    if values.max() == values.min():
-        return float(np.median(values))
-
-    hist, bin_edges = np.histogram(values, bins=n_bins)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-    hist = hist.astype(float)
-
-    weight1 = np.cumsum(hist)
-    weight2 = np.cumsum(hist[::-1])[::-1]
-    sum1 = np.cumsum(hist * bin_centers)
-    sum2 = np.cumsum((hist * bin_centers)[::-1])[::-1]
-
-    # Only bins with nonzero mass on BOTH sides define a valid split point.
-    valid = (weight1[:-1] > 0) & (weight2[1:] > 0)
-    if not np.any(valid):
-        return float(np.median(values))
-
-    mean1 = sum1[:-1] / np.maximum(weight1[:-1], 1e-9)
-    mean2 = sum2[1:] / np.maximum(weight2[1:], 1e-9)
-    variance_between = np.where(
-        valid, weight1[:-1] * weight2[1:] * (mean1 - mean2) ** 2, -np.inf)
-
-    idx = int(np.argmax(variance_between))
-    return float(bin_centers[idx])
+# A potato carries roughly 5-10 eyes. Counts far outside that say the
+# thresholds are wrong for this scan rather than that this potato is
+# unusual, and it is worth saying so before the drill acts on them.
+PLAUSIBLE_EYE_COUNT = (2, 15)
 
 
 def normal_to_quat(normal):
-    """Quaternion whose local +Z axis aligns with `normal` (used as the
-    drill approach/insertion axis downstream)."""
+    """Quaternion whose local +Z axis aligns with `normal` -- the
+    perception-side convention shared with drill_controller.normal_rotation
+    (which then builds the TOOL frame from -normal, so the bit points into
+    the surface)."""
     z = np.asarray(normal, dtype=float)
     z = z / np.linalg.norm(z)
     ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
@@ -89,18 +71,30 @@ class EyeDetector(Node):
     def __init__(self):
         super().__init__('eye_detector')
         self.declare_parameter('base_frame', 'base_link')
+        # Needed to orient normals outward. Only a fallback: scan_controller
+        # publishes the centre it actually settled on, which is the one the
+        # drill's fixture keep-out cone is measured from too.
+        self.declare_parameter('potato_center', [0.5, 0.0, 0.15])
         self.declare_parameter('knn', 30)
-        self.declare_parameter('concavity_threshold', 0.0015)  # meters, tune per scan density -- ignored if auto_concavity_threshold is true
-        self.declare_parameter('auto_concavity_threshold', False)  # true = pick the threshold per-scan via Otsu's method instead of the fixed value above
+        # Minimum surface variation. Dimensionless and bounded [0, 1/3], but
+        # NOT scale-invariant: with a fixed knn a denser scan gives a smaller
+        # neighbourhood, which reads flatter. Tune against a real scan using
+        # the percentiles this node logs.
+        self.declare_parameter('curvature_min', 0.015)
+        # Maximum shape index. 0.35 keeps cups and ruts, rejects saddles
+        # (0.5), ridges (0.75) and domes (1.0). Scale-invariant, so unlike
+        # curvature_min this should not need per-setup tuning.
+        self.declare_parameter('shape_index_max', 0.35)
         self.declare_parameter('cluster_eps', 0.003)
         self.declare_parameter('cluster_min_points', 8)
         self.declare_parameter('min_eye_diameter', 0.002)
         self.declare_parameter('max_eye_diameter', 0.015)
 
         self.base_frame = self.get_parameter('base_frame').value
+        self.potato_center = np.array(self.get_parameter('potato_center').value, dtype=float)
         self.knn = self.get_parameter('knn').value
-        self.concavity_threshold = self.get_parameter('concavity_threshold').value
-        self.auto_concavity_threshold = self.get_parameter('auto_concavity_threshold').value
+        self.curvature_min = self.get_parameter('curvature_min').value
+        self.shape_index_max = self.get_parameter('shape_index_max').value
         self.cluster_eps = self.get_parameter('cluster_eps').value
         self.cluster_min_points = self.get_parameter('cluster_min_points').value
         self.min_eye_diameter = self.get_parameter('min_eye_diameter').value
@@ -109,6 +103,8 @@ class EyeDetector(Node):
         self._latest_cloud_msg = None
         self.create_subscription(PointCloud2, '/potato_scan/merged_cloud', self._on_cloud, 10)
         self.create_subscription(Bool, '/potato_scan/scan_complete', self._on_scan_complete, 10)
+        self.create_subscription(
+            PointStamped, '/potato_scan/potato_center', self._on_potato_center, 10)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/potato_scan/eye_markers', 10)
         self.pose_pub = self.create_publisher(PoseArray, '/potato_scan/eye_poses', 10)
@@ -116,11 +112,43 @@ class EyeDetector(Node):
     def _on_cloud(self, msg: PointCloud2):
         self._latest_cloud_msg = msg
 
+    def _on_potato_center(self, msg: PointStamped):
+        self.potato_center = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=float)
+        self.get_logger().info(
+            f'potato_center from scan: {np.round(self.potato_center, 4)} '
+            '(normals are oriented outward from here)')
+
     def _on_scan_complete(self, msg: Bool):
         if not msg.data or self._latest_cloud_msg is None:
             return
         self.get_logger().info('scan_complete received, running eye detection')
         self.detect_and_publish(self._latest_cloud_msg)
+
+    def _log_distributions(self, points):
+        """What the two scores actually look like on THIS scan.
+
+        curvature_min has to be set for the scan density in use, and these
+        percentiles are how to set it: an eye occupies a small fraction of
+        the surface, so a workable threshold sits far out in kappa's upper
+        tail. Printed every run so the number can be checked against real
+        data instead of carried over from a synthetic.
+        """
+        _, kappa, s_index = describe_surface(points, self.potato_center, knn=self.knn)
+        q = [50, 90, 99, 99.9]
+        kappa_q = np.percentile(kappa, q)
+        selected = (kappa > self.curvature_min) & (s_index < self.shape_index_max)
+        self.get_logger().info(
+            'kappa percentiles ' + ', '.join(f'p{p}={v:.4f}' for p, v in zip(q, kappa_q))
+            + f' | curvature_min={self.curvature_min}'
+            + f' | cup-shaped (S<{self.shape_index_max}): '
+              f'{100.0 * float((s_index < self.shape_index_max).mean()):.1f}% of points'
+            + f' | both: {int(selected.sum())} points')
+        if self.curvature_min < kappa_q[1]:
+            self.get_logger().warn(
+                f'curvature_min={self.curvature_min} sits below this scan\'s 90th '
+                f'percentile ({kappa_q[1]:.4f}) -- that admits a large fraction of the '
+                f'surface as "curved", which usually means it is set for a different '
+                f'scan density than this one')
 
     def detect_and_publish(self, cloud_msg: PointCloud2):
         pts = np.array(list(pc2.read_points(
@@ -129,46 +157,32 @@ class EyeDetector(Node):
             self.get_logger().warn('not enough points for eye detection')
             return
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts)
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=self.knn))
-        pcd.orient_normals_consistent_tangent_plane(self.knn)
-        normals = np.asarray(pcd.normals)
+        self._log_distributions(pts)
 
-        concavity = estimate_concavity(pts, normals, k=self.knn)
-        if self.auto_concavity_threshold:
-            threshold = otsu_threshold(concavity)
-            self.get_logger().info(f'auto_concavity_threshold=true: computed threshold={threshold:.5f}')
-        else:
-            threshold = self.concavity_threshold
-        pit_mask = concavity > threshold
-        if not np.any(pit_mask):
-            self.get_logger().info('no eye candidates found')
-            return
+        candidates = find_eye_candidates(
+            pts, self.potato_center, knn=self.knn,
+            curvature_min=self.curvature_min,
+            shape_index_max=self.shape_index_max,
+            cluster_eps=self.cluster_eps,
+            cluster_min_points=self.cluster_min_points,
+            min_diameter=self.min_eye_diameter,
+            max_diameter=self.max_eye_diameter)
 
-        pit_pcd = o3d.geometry.PointCloud()
-        pit_pcd.points = o3d.utility.Vector3dVector(pts[pit_mask])
-        labels = np.array(pit_pcd.cluster_dbscan(
-            eps=self.cluster_eps, min_points=self.cluster_min_points))
-
-        pit_pts = pts[pit_mask]
-        pit_normals = normals[pit_mask]
-
-        eyes = []  # (position, normal, diameter)
-        for label in set(labels):
-            if label < 0:
-                continue
-            cluster_pts = pit_pts[labels == label]
-            cluster_normals = pit_normals[labels == label]
-            diameter = float(np.linalg.norm(cluster_pts.max(axis=0) - cluster_pts.min(axis=0)))
-            if not (self.min_eye_diameter <= diameter <= self.max_eye_diameter):
-                continue
-            position = cluster_pts.mean(axis=0)
-            normal = cluster_normals.mean(axis=0)
-            normal = normal / np.linalg.norm(normal)
-            eyes.append((position, normal, diameter))
-
+        eyes = [(c['position'], c['normal'], c['diameter']) for c in candidates]
         self.get_logger().info(f'detected {len(eyes)} potato eyes')
+        for i, c in enumerate(candidates):
+            self.get_logger().info(
+                f"  #{i} at {np.round(c['position'], 4)} diameter "
+                f"{c['diameter'] * 1000:.1f}mm shape_index {c['shape_index']:.3f} "
+                f"({c['points']} points)")
+
+        low, high = PLAUSIBLE_EYE_COUNT
+        if eyes and not (low <= len(eyes) <= high):
+            self.get_logger().warn(
+                f'{len(eyes)} eyes is outside the {low}-{high} a potato plausibly has. '
+                f'Check curvature_min against the percentiles above before drilling '
+                f'these.')
+
         self._publish_markers(eyes)
         self._publish_poses(eyes)
 

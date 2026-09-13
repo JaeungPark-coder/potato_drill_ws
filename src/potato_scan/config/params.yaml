@@ -104,8 +104,23 @@ pointcloud_accumulator:
 eye_detector:
   ros__parameters:
     base_frame: "base_link"
+    # Fallback only -- scan_controller publishes the centre it settled on over
+    # /potato_scan/potato_center, and normals are oriented outward from it.
+    potato_center: [0.50, 0.00, 0.15]
     knn: 30
-    concavity_threshold: 0.0015  # meters; tune against a real scan before trusting it
+    # "How curved": surface variation kappa = lambda0 / sum(lambda), from the
+    # neighbourhood covariance. Dimensionless and bounded [0, 1/3], which is
+    # why it replaced the old concavity_threshold (an offset in metres that
+    # sat near the sensor noise floor). It is NOT scale-invariant though: a
+    # denser scan gives a smaller neighbourhood and a lower kappa, so set this
+    # against the percentiles eye_detector logs on a real scan. 0.015 is
+    # validated on a synthetic potato at ~0.9 mm spacing, not on a real one.
+    curvature_min: 0.015
+    # "Which way curved": Chen & Bhanu's shape index, 0 = cup (an eye),
+    # 0.5 = saddle, 0.75 = ridge, 1.0 = dome (the potato's own body). Scale-
+    # invariant, so unlike curvature_min this should not need tuning. Curvature
+    # alone cannot tell a pit from the ridge beside it; this is what does.
+    shape_index_max: 0.35
     cluster_eps: 0.003
     cluster_min_points: 8
     min_eye_diameter: 0.002
