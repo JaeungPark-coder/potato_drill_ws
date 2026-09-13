@@ -267,3 +267,52 @@ def approach_pose_along_axis(position, tool_z_axis, standoff):
     tool_z_axis = np.asarray(tool_z_axis, dtype=float)
     tool_z_axis = tool_z_axis / np.linalg.norm(tool_z_axis)
     return position - tool_z_axis * standoff
+
+
+def helical_cut_path(contact_position, tool_z_axis, depth, lateral_radius,
+                     turns=2.0, points_per_turn=16):
+    """Waypoints that widen a bored hole into a conical pocket on the way out.
+
+    The plunge (robot_interface.force_drill) has already cut a hole of the
+    bit's own diameter down to `depth`, measured from the contact point. This
+    is the pass that follows: a helix that spirals outward as it rises, from
+    the bottom of that hole (radius 0) to `lateral_radius` at the surface.
+
+    That shape is the point. Removing a sprout eye is not the same as
+    sampling tissue -- the literature's biopsy punch bores a straight core
+    and tilts to detach it, while the pineapple machines cut a cone and lift
+    the plug out. A cone is the right shape here, and it also means the
+    widening pass IS the retraction: the tool ends at the surface having
+    already left the material, with no separate withdrawal.
+
+    The parameterisation is deliberately one that subsumes both options the
+    project had not decided between, so the choice can be made by measurement
+    (or learned) rather than up front:
+
+        lateral_radius == 0     a straight pull-out: the motion is exactly
+                                the bore the plunge already made
+        lateral_radius > 0      a conical scoop, wider at the skin
+
+    Returns (N, 3) positions in the base frame, ordered bottom to surface.
+    `tool_z_axis` is the insertion axis, pointing INTO the surface, so the
+    hole bottom sits at contact + axis * depth.
+    """
+    contact_position = np.asarray(contact_position, dtype=float)
+    axis = np.asarray(tool_z_axis, dtype=float)
+    axis = axis / np.linalg.norm(axis)
+
+    # any two unit vectors spanning the plane the helix turns in
+    reference = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    u = np.cross(reference, axis)
+    u = u / np.linalg.norm(u)
+    v = np.cross(axis, u)
+
+    n_points = max(2, int(round(turns * points_per_turn)) + 1)
+    s = np.linspace(0.0, 1.0, n_points)          # 0 at the bottom, 1 at the surface
+    angle = 2.0 * np.pi * turns * s
+    radius = lateral_radius * s
+
+    return (contact_position
+            + np.outer(depth * (1.0 - s), axis)
+            + np.outer(radius * np.cos(angle), u)
+            + np.outer(radius * np.sin(angle), v))

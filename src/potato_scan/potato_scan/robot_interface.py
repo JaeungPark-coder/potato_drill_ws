@@ -51,6 +51,12 @@ class UR5eInterface:
     def drill_off(self):
         self.io.setToolDigitalOut(self.drill_output_pin, False)
 
+    def tcp_force_magnitude(self):
+        """Magnitude of the measured TCP force. Used by the widening pass,
+        which is position-controlled and so has to watch the force itself
+        rather than have force_mode hold it."""
+        return float(np.linalg.norm(self.receive.getActualTCPForce()[:3]))
+
     def force_drill(self, task_frame, axis_index=2, feed_force=15.0, max_force=40.0,
                      max_depth=0.008, timeout_s=8.0, poll_dt=0.05,
                      contact_force=5.0, max_approach_travel=0.05,

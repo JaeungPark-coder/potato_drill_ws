@@ -164,6 +164,15 @@ drill_controller:
     potato_center: [0.50, 0.00, 0.15]
     fixture_axis: [0.0, 0.0, -1.0]
     fixture_keepout_half_angle_deg: 35.0
+    # Shape of the cut. The plunge always bores to max_depth; this is the
+    # pass that follows, spiralling outward as it rises so the hole opens
+    # into a cone, and ending at the surface so it doubles as the retraction.
+    # 0.0 = straight pull-out, i.e. exactly the bore the plunge made and the
+    # only behaviour validated so far. Raising it is what turns "drill a
+    # hole" into "scoop the eye out", and it is the knob a learned policy
+    # would set per eye rather than a choice that has to be made up front.
+    cut_lateral_radius: 0.0
+    cut_turns: 2.0
     # Task tolerance on the insertion axis -- how far off the surface
     # normal the drill may be aimed when no reachable pose exists straight
     # down it. Tried smallest-first, so a tilt is only used as a fallback.

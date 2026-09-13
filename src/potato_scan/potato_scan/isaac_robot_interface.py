@@ -160,6 +160,12 @@ class IsaacSimRobotInterface:
     def drill_off(self):
         self.drill_state_pub.publish(Bool(data=False))
 
+    def tcp_force_magnitude(self):
+        """Magnitude of the simulated contact force, or None before any
+        wrench has arrived -- same contract as UR5eInterface's, except that
+        this one can legitimately not know yet."""
+        return self._current_force_mag()
+
     def force_drill(self, task_frame, axis_index=2, feed_force=15.0, max_force=40.0,
                      max_depth=0.008, timeout_s=8.0, poll_dt=0.05,
                      contact_force=5.0, max_approach_travel=0.05,

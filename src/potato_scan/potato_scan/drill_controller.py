@@ -39,7 +39,7 @@ from potato_scan.robot_interface import UR5eInterface
 from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 from potato_scan.drill_task_planner import (
     plan_visit_order, approach_pose_along_axis, approach_blocked_by_fixture,
-    EyeAttempt, format_attempt_table)
+    helical_cut_path, EyeAttempt, format_attempt_table)
 
 # Roll offsets (degrees, about the insertion axis) tried in order when the
 # default approach orientation is unreachable. Smallest deviation from
@@ -131,6 +131,21 @@ class DrillController(Node):
         self.declare_parameter('potato_center', [0.5, 0.0, 0.15])
         self.declare_parameter('fixture_axis', [0.0, 0.0, -1.0])
         self.declare_parameter('fixture_keepout_half_angle_deg', 35.0)
+        # Shape of the cut. The plunge always bores to max_depth; this is
+        # the pass that follows, spiralling outward as it rises so the hole
+        # opens into a cone -- and since it ends at the surface, it doubles
+        # as the retraction.
+        #
+        # 0.0 means a straight pull-out, i.e. exactly the bore the plunge
+        # made, which is the behaviour this had before and the only one
+        # anything has been validated against. Raising it trades a wider
+        # removal for more material taken and more force, and it is the
+        # natural knob for a learned policy to set per eye: eyes sit at
+        # different depths in differently shaped potatoes, and the
+        # literature's own failures cluster on shallow ones at the edges,
+        # where a wider, shallower cut is what is wanted.
+        self.declare_parameter('cut_lateral_radius', 0.0)
+        self.declare_parameter('cut_turns', 2.0)
         self.declare_parameter('max_approach_tilt_deg', 15.0)
         self.declare_parameter('approach_tilt_step_deg', 7.5)
         self.declare_parameter('approach_policy', 'heuristic')
@@ -141,6 +156,8 @@ class DrillController(Node):
         self.feed_force = self.get_parameter('feed_force').value
         self.max_force = self.get_parameter('max_force').value
         self.contact_force = self.get_parameter('contact_force').value
+        self.cut_lateral_radius = self.get_parameter('cut_lateral_radius').value
+        self.cut_turns = self.get_parameter('cut_turns').value
         self.potato_center = np.array(self.get_parameter('potato_center').value, dtype=float)
         self.fixture_axis = np.array(self.get_parameter('fixture_axis').value, dtype=float)
         self.fixture_keepout_half_angle_deg = self.get_parameter(
@@ -259,6 +276,41 @@ class DrillController(Node):
             f'{self.tilt_search_deg[-1]:.1f}deg); {blocked} more were inside the fixture cone)')
         return None, None, 0.0, 0.0, 'unreachable'
 
+    def _widening_pass(self, rotvec, reached_depth_m):
+        """Spiral out of the hole just bored, opening it into a cone.
+
+        Position-controlled, unlike the plunge: force_mode holds a force
+        along ONE axis, and this moves in all three. So it watches the force
+        itself and stops early if the cut binds, leaving a bored hole rather
+        than forcing a wider one.
+
+        The path starts where the tool already is -- the bottom of the hole
+        -- so the contact point is recovered from the current pose and the
+        depth force_drill reported, rather than being tracked separately.
+
+        Returns (waypoints_followed, stopped_on_force).
+        """
+        rotation = Rot.from_rotvec(rotvec).as_matrix()
+        tool_z = rotation[:, 2]
+        bottom, _ = self.robot.get_tcp_pose()
+        contact = np.asarray(bottom, dtype=float) - tool_z * reached_depth_m
+
+        path = helical_cut_path(contact, tool_z, reached_depth_m,
+                                self.cut_lateral_radius, turns=self.cut_turns)
+
+        for i, waypoint in enumerate(path):
+            if not self.robot.move_to_pose(waypoint, rotvec):
+                self.get_logger().warn(
+                    f'widening pass: waypoint {i}/{len(path)} unreachable, stopping there')
+                return i, False
+            force = self.robot.tcp_force_magnitude()
+            if force is not None and force >= self.max_force:
+                self.get_logger().warn(
+                    f'widening pass: {force:.1f}N at waypoint {i}/{len(path)} reached '
+                    f'max_force -- stopping with the bore cut but not widened')
+                return i, True
+        return len(path), False
+
     def _fixture_blocks(self, approach_position):
         return approach_blocked_by_fixture(
             approach_position, self.potato_center, self.fixture_axis,
@@ -356,7 +408,13 @@ class DrillController(Node):
                 index=idx, status=outcome.status, depth_m=outcome.depth_m,
                 peak_force_n=outcome.peak_force_n, tilt_deg=tilt_deg, roll_deg=roll_deg))
 
-            self.robot.move_to_pose(approach, rotvec)  # retract
+            if self.cut_lateral_radius > 0.0 and outcome.contacted:
+                followed, on_force = self._widening_pass(rotvec, outcome.depth_m)
+                self.get_logger().info(
+                    f'eye {idx}: widening pass followed {followed} waypoints'
+                    + (' (stopped on force)' if on_force else ''))
+
+            self.robot.move_to_pose(approach, rotvec)  # clear the surface
             self.robot.drill_off()
 
         self.get_logger().info('drilling pass complete')
