@@ -48,10 +48,16 @@ from isaacsim.core.utils.nucleus import get_assets_root_path  # noqa: E402
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage  # noqa: E402
 from isaacsim.core.prims import SingleArticulation  # noqa: E402
 
-# Bridges the ROS2-installed potato_scan package onto sys.path -- same
-# mechanism isaac_scene.py already relies on for `import rclpy`. Requires
-# the workspace to be colcon-built and `source install/setup.bash`'d in
-# the terminal BEFORE launching this via python.sh.
+# Bridges the ROS2-installed potato_scan package onto sys.path. Requires the
+# workspace to be colcon-built and `source install/setup.bash`'d in the
+# terminal BEFORE launching this via python.sh.
+#
+# Sourcing is safe HERE and is not safe everywhere: this file never imports
+# rclpy, so it only wants potato_scan on the path. isaac_scene.py does import
+# rclpy, and sourcing system ROS 2 puts its Python-3.10 build ahead of the
+# Python-3.11 one Kit ships -- which is why the README tells you to run THAT
+# script under `env -i` with nothing sourced. Do not carry this line's advice
+# over to it.
 enable_extension("isaacsim.ros2.bridge")  # noqa: E402
 
 from isaac_sim_common import (  # noqa: E402

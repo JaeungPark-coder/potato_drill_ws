@@ -81,10 +81,18 @@ from std_msgs.msg import Header
 import tf2_ros
 from scipy.spatial.transform import Rotation as Rot
 
-# the single definition of the +Z-is-outward-normal convention; the
-# detector publishes eyes in it too, which is what makes the two
-# PoseArrays comparable without either side restating the rule
-from potato_scan.drill_task_planner import normal_rotation
+# The single definition of the +Z-is-outward-normal convention; the detector
+# publishes eyes in it too, which is what makes the two PoseArrays comparable
+# without either side restating the rule.
+#
+# The path insert is required, not tidiness. This script runs under Isaac
+# Sim's own interpreter and, per the README, deliberately WITHOUT sourcing the
+# ROS 2 workspace -- so the installed potato_scan package is not importable,
+# and a plain `python isaac/isaac_scene.py` puts only isaac/ on sys.path, not
+# its parent. Without this the import fails before the scene is built at all.
+# Same idiom collect_rlds_episodes.py uses to share EULER_SEQ across trees.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from potato_scan.drill_task_planner import normal_rotation  # noqa: E402
 
 # Scene-building helpers (potato mesh, drill tip, contact sensor, RMPflow
 # setup, world-pose readout) live in isaac_sim_common.py, shared with the
