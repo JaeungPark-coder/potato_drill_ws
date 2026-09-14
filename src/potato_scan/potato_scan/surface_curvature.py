@@ -243,7 +243,8 @@ def describe_surface(points, potato_center, knn=30):
 def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
                         shape_index_max=0.35, cluster_eps=0.003,
                         cluster_min_points=8, min_diameter=0.002,
-                        max_diameter=0.015, colors=None, min_color_contrast=None):
+                        max_diameter=0.015, colors=None, min_color_contrast=None,
+                        max_center_distance=None):
     """The whole point-cloud half of eye detection, with no ROS in it.
 
     Selects points that are both curved enough (kappa) and cup-shaped (S),
@@ -289,6 +290,20 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
     looked at on real potatoes: the visible band is a weak tuber-vs-soil
     discriminator on its own, reliable on wet material and doubtful when
     dry, so it belongs as evidence before it belongs as a gate.
+
+    `max_center_distance` is the other kind of gate `potato_center` alone
+    doesn't provide: that argument only orients normals (via
+    `describe_surface`), it never restricts WHICH points are even
+    considered. CONFIRMED 2026-09-14 against a real (not synthetic)
+    Isaac Sim merged cloud: 4 of 11 "eyes" clustered near
+    [0.04-0.07, 0.03-0.07, ...] -- nowhere near the potato (potato_center
+    was ~[0.48, -0.01, 0.16]) -- because the ROBOT'S OWN BASE happened to
+    satisfy the same curvature+shape-index window. Left at None (the
+    default) nothing is filtered, matching prior behaviour exactly, so
+    every existing synthetic-cloud test (which never contained anything
+    but the potato to begin with) still passes unchanged. A real scan's
+    cloud is not that clean -- set this to a bound a few mm past the
+    expected potato radius before trusting real detections.
     """
     points = np.asarray(points, dtype=float)
     if len(points) < knn + 1:
@@ -310,6 +325,11 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
         diameter = float(np.linalg.norm(cluster.max(axis=0) - cluster.min(axis=0)))
         if not (min_diameter <= diameter <= max_diameter):
             continue
+
+        if max_center_distance is not None:
+            center_distance = float(np.linalg.norm(cluster.mean(axis=0) - potato_center))
+            if center_distance > max_center_distance:
+                continue
 
         color_contrast, n_surround = 0.0, 0
         if colors is not None:

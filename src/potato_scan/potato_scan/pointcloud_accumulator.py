@@ -103,11 +103,19 @@ class PointCloudAccumulator(Node):
 
         has_rgb = any(f.name == 'rgb' for f in msg.fields)
         fields = ('x', 'y', 'z', 'rgb') if has_rgb else ('x', 'y', 'z')
+        # read_points returns a STRUCTURED array (one named dtype field per
+        # requested field name), not a plain (N, len(fields)) float array --
+        # CONFIRMED 2026-09-14 against this project's own isaac_scene.py
+        # publisher: raw[:, :3] on that raised "too many indices for array:
+        # array is 1-dimensional, but 2 were indexed" on every single cloud,
+        # so this had never actually been run against a real PointCloud2
+        # message before. Indexed by field name instead, which works
+        # regardless of the array's dtype layout.
         raw = np.array(list(pc2.read_points(msg, field_names=fields, skip_nans=True)))
         if raw.size == 0:
             return
-        points = raw[:, :3]
-        colors = unpack_rgb(raw[:, 3]) if has_rgb else None
+        points = np.column_stack([raw['x'], raw['y'], raw['z']])
+        colors = unpack_rgb(raw['rgb']) if has_rgb else None
         if not has_rgb and not self._warned_no_rgb:
             self._warned_no_rgb = True
             self.get_logger().warn(

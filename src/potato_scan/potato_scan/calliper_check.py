@@ -35,7 +35,6 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseArray
 from scipy.spatial.transform import Rotation as Rot
 
-from potato_scan.robot_interface import UR5eInterface
 from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 from potato_scan.drill_task_planner import (
     approach_candidates, tilt_search_sequence, ROLL_SEARCH_DEG)
@@ -71,6 +70,10 @@ class CalliperCheck(Node):
                 tcp_frame=self.get_parameter('tcp_frame').value,
                 callback_group=self._cb_group)
         else:
+            # Lazy import -- see scan_controller.py's matching comment:
+            # robot_interface.py imports rtde_control at module level, which
+            # is not installed for robot_backend:=isaac_sim.
+            from potato_scan.robot_interface import UR5eInterface
             self.robot = UR5eInterface(
                 self.get_parameter('robot_ip').value,
                 speed=self.get_parameter('approach_speed').value,

@@ -84,6 +84,70 @@ brings it) and nothing else — no ROS, no Open3D, no robot. It is the same
 suite `colcon test` runs.
 
 
+## Running against Isaac Sim instead of real hardware
+
+`isaac/isaac_scene.py` stands in for the robot and the camera --
+`robot_backend:=isaac_sim` talks to it over the same ROS2 topics/TF a real
+cell would use. It needs Isaac Sim's own Kit Python runtime, so run it with
+that environment's interpreter, not the ROS2 workspace's:
+
+```bash
+ISAAC_ENV=/home/icrs/bigdisk/conda_envs/env_isaaclab
+ROS2_BRIDGE_HUMBLE=$ISAAC_ENV/lib/python3.11/site-packages/isaacsim/exts/isaacsim.ros2.bridge/humble
+env -i HOME="$HOME" PATH="/usr/bin:/bin" \
+  ROS_DOMAIN_ID=$ROS_DOMAIN_ID \
+  LD_PRELOAD=$ISAAC_ENV/lib/libstdc++.so.6 \
+  LD_LIBRARY_PATH=$ROS2_BRIDGE_HUMBLE/lib \
+  $ISAAC_ENV/bin/python isaac/isaac_scene.py
+```
+
+Three things about this that are not obvious, all CONFIRMED 2026-09-14 (this
+was the first time this script had actually been run since it was written):
+
+**`ROS_DOMAIN_ID` has to be passed through explicitly.** The `env -i` below
+is deliberate (see the `rclpy` note next) and wipes the whole environment,
+including `ROS_DOMAIN_ID` if your shell sets a non-default one (this
+machine's does: 77) -- without it, this process ends up on domain 0 while
+`ros2 launch` (run from a normal shell) is on whatever your shell has,
+and the two halves never discover each other at all: no shared error, just
+an empty `ros2 topic list`/`ros2 node list` from the other side and every
+downstream TF lookup and point cloud subscription silently starved. Confirm
+they match with `ros2 node list` (should show `/isaac_scene_bridge`) before
+debugging anything further up the pipeline.
+
+**`scan.launch.py` does not include `eye_detector`/`drill_controller` at
+all** -- only `potato_drill.launch.py` does. If a `/potato_scan/scan_complete`
+or `/potato_scan/start_drilling` you published seems to vanish, `ros2 node
+list` first: it should show whichever of `/scan_controller`,
+`/pointcloud_accumulator`, `/eye_detector`, `/drill_controller` your launch
+file actually started, alongside `/isaac_scene_bridge`.
+
+**Do not `source /opt/ros/humble/setup.bash` first.** Isaac Sim's Kit
+runtime is built against Python 3.11; system ROS2 Humble's `rclpy` is built
+against Python 3.10, and its compiled extension
+(`_rclpy_pybind11.cpython-310-*.so`) does not exist for 3.11. Sourcing the
+system install puts that incompatible `rclpy` on `sys.path` ahead of Isaac
+Sim's own bundled one, so `import rclpy` fails with `No module named
+'rclpy._rclpy_pybind11'` even though Isaac Sim ships a working Python-3.11
+build of `rclpy` at `$ROS2_BRIDGE_HUMBLE/rclpy` for exactly this situation --
+`enable_extension("isaacsim.ros2.bridge")` finds it on its own as long as
+nothing else got there first. The `env -i` above exists specifically to
+guarantee that: a shell that has ever sourced ROS2 in this session still has
+it on `PYTHONPATH` otherwise.
+
+**The first run after installing/updating Isaac Sim renders slowly, not
+brokenly.** RTX shader compilation (`RtPso async group`) for this scene's
+particular material/camera combination took over a minute the first time and
+looked identical to a hang; it was fast (~15s to the running message) on
+every run after, once cached. Give it a few minutes before assuming it is
+stuck, and check the Kit log named on startup (`Logging to file: ...`) for
+`Waiting for RtPso async group async compilation: N seconds so far` lines,
+which do not appear on the redirected stdout/stderr this script's own prints
+go to.
+
+Stop it with Ctrl+C, or let a supervisor send SIGTERM -- either is safe as
+of the shutdown fix below.
+
 ## Bring-up order
 
 The order matters. Each step's output is the next step's input, and a wrong
@@ -349,9 +413,175 @@ on effects this model omits, not on geometry.
 
 ## Known gaps
 
-- **Nothing here has been run against a robot or a camera.** Every number is
-  from synthetic data, analytic surfaces, or stubbed backends. Step 4 is what
-  changes that first, and cheaply.
+- **Nothing here has been run against a REAL robot or camera.** Every number
+  is from synthetic data, analytic surfaces, or stubbed backends. Step 4 is
+  what changes that first, and cheaply. `isaac/isaac_scene.py` (the Isaac Sim
+  stand-in) has now been run for the first time, and the scan half of the
+  pipeline verified against it end-to-end (real accumulated point cloud ->
+  real coverage/centre estimate) -- 2026-09-14, see "Running against Isaac
+  Sim instead of real hardware" above and the fixes below.
+- **`isaac_scene.py` crashed on shutdown -- found and fixed 2026-09-14.** A
+  plain SIGTERM (e.g. from a process supervisor, or `timeout` in a smoke
+  test) is not a `KeyboardInterrupt`: rclpy installs its own SIGTERM handler
+  that calls `context.shutdown()` from inside the signal handler, racing
+  whatever line happened to be executing. That left `rclpy.spin_once()`
+  mid-call raising `RCLError` ("the given context is not valid"), which the
+  old `except KeyboardInterrupt` did not catch -- so it propagated straight
+  through the `finally` block's `rclpy.shutdown()` (raising a second,
+  already-shut-down error) before ever reaching the Replicator cleanup below
+  it, and `simulation_app.close()` then tore down the extension stack with a
+  live pointcloud annotator and render product still attached -- a native
+  SIGSEGV in `omni.graph.core.plugin`/`omni.syntheticdata.plugin` during
+  `Py_FinalizeEx`, not a Python-catchable error. Fixed by catching `Exception`
+  broadly around the loop and running each cleanup step
+  (`destroy_node`/`rclpy.shutdown`/`annotator.detach`/`render_product.destroy`)
+  independently in its own `try`, so one failing step can no longer skip the
+  ones after it.
+- **The drill tip's contact sensor never left its constructor default --
+  found and fixed 2026-09-14.** `ContactForceReader.read()` kept reporting
+  zero force no matter how the tip was driven; a standalone probe (query
+  `isaacsim.sensors.physics._sensor`'s interface directly, bypassing this
+  project's wrapper) showed `get_sensor_reading(...).is_valid` was `False`
+  on every single call, so `get_current_frame()` was silently leaving the
+  whole dict at `{"time": 0, "physics_step": 0}` forever rather than raising
+  -- indistinguishable from "genuinely no contact" unless you check
+  `is_valid` yourself. Root cause: PhysX parses contact-report registrations
+  when the physics scene (re)starts, and `ContactSensor`/`add_drill_tip` are
+  both constructed well after `isaac_scene.py`'s first `world.reset()` --
+  so PhysX never saw either one. A second `world.reset()` +
+  `robot.initialize()` right after `ContactForceReader(...)` is constructed
+  (after every physics-relevant prim for the episode already exists) is what
+  actually binds it; neither a `dt=`/`sensor_period=` change nor manually
+  applying `PhysxContactReportAPI` to the rigid-body link were needed once
+  that reset was in place. `rl_drill_train_env.py`'s `IsaacDrillEnv` looks
+  like it already gets this for free by construction -- `__init__` builds
+  `ContactForceReader` once, and Gymnasium always calls `reset()` (which
+  does its own `world.reset()`/`robot.initialize()`) before the first
+  `step()`, so the required second reset already happens -- but this is
+  read from the code, not confirmed live: a standalone check crashed on
+  startup from running a second concurrent Isaac Sim instance alongside the
+  one already up for the `isaac_scene.py` testing above, not from anything
+  in the script itself. Worth a clean, isolated re-check before trusting it.
+- **Three files misread `PointCloud2` messages -- found and fixed
+  2026-09-14, confirmed against `isaac_scene.py`'s real published cloud, not
+  a mock.** `pointcloud_accumulator.py`, `scan_controller.py`, and
+  `eye_detector.py` all did
+  `raw = np.array(list(pc2.read_points(msg, field_names=(...), skip_nans=True)))`
+  then sliced it as a plain `raw[:, :3]` -- but `read_points` returns a
+  STRUCTURED array (one named dtype field per requested name), which is
+  1-dimensional; indexing a second axis raises `IndexError: too many indices
+  for array`, and casting the whole structured array to `float` (as
+  `surface_coverage.estimate_center` did downstream) raises `TypeError:
+  Cannot cast array data from dtype([('x','<f4'),...]) to dtype('float64')`.
+  Every one of these was reached and crashed the owning node the first time
+  it processed a real cloud. Fixed by indexing fields by name
+  (`np.column_stack([raw['x'], raw['y'], raw['z']])`) instead of by position.
+- **`scan_controller.py`/`drill_controller.py`/`calliper_check.py` crashed
+  immediately under `robot_backend:=isaac_sim` -- found and fixed
+  2026-09-14.** All three `import`ed `potato_scan.robot_interface` (which
+  imports `rtde_control` at module level) unconditionally at the top of the
+  file, even though the constructor only reaches that branch for
+  `robot_backend:='rtde'`. Without `ur_rtde` installed -- correct per this
+  README's own "Isaac backend does not need it" -- every one of the three
+  died on startup with `ModuleNotFoundError: No module named 'rtde_control'`
+  regardless of which backend was actually requested. Fixed by moving the
+  `UR5eInterface` import into the `else` (rtde) branch in each file.
+- **First successful scan against Isaac Sim, 2026-09-14, after the fixes
+  above.** `ros2 launch potato_scan scan.launch.py robot_backend:=isaac_sim`
+  against a running `isaac_scene.py`: `potato_center` converged to within a
+  few mm to ~2.5cm of the configured value from real accumulated points
+  (see the drift note below), and `estimated_potato_radius` converged near
+  the mesh's actual ~35-57mm range.
+- **Almost every "unreachable at every camera roll" view was a false
+  positive from a concurrency bug, not a real workspace limit -- found and
+  fixed 2026-09-14.** Initially looked exactly like the README's own
+  documented explanation (orbit outside the arm's envelope): coverage
+  plateaued around 53% with dozens of views across every azimuth failing.
+  Debug instrumentation in `IsaacSimRobotInterface.move_to_pose` showed
+  each failed attempt gave up at the full 6s `settle_timeout_s` with
+  `pos_err`/`rot_err` nowhere near converging (5-27cm / 68-121deg,
+  different every time) -- not the small, consistent residual a genuinely
+  out-of-reach pose leaves. Cause: `ScanController`'s 0.5s `_run_step`
+  timer was registered on the same `ReentrantCallbackGroup` as its
+  subscriptions. `ReentrantCallbackGroup.can_execute()` returns True
+  unconditionally, so the `MultiThreadedExecutor` re-armed and re-entered
+  `_run_step` every 0.5s even while the previous call was still blocked
+  inside `move_to_pose`'s up-to-6s wait -- multiple concurrent `_run_step`
+  calls kept publishing different Cartesian targets to the same robot, so
+  nothing ever got the several seconds RMPflow needs to actually converge
+  (see vla_ur5e_ws's near-identical bug and fix, same root cause: a timer
+  and its own blocking work sharing a reentrant group). Fixed by giving the
+  timer its own `MutuallyExclusiveCallbackGroup`, leaving the TF/point-count
+  subscriptions on the reentrant one so they keep refreshing while
+  `_run_step` blocks. Effect measured directly: 40+ spurious failures
+  covering every azimuth dropped to 1 genuine one, and a single raster view
+  now reaches 24% coverage on its own (versus many thrashing "views" needed
+  to reach a similar number before, none of which had actually settled).
+  One side effect worth watching, not yet explained: `potato_center`
+  drifted a real ~26mm from the configured value over the course of the
+  first two (now properly-settled) views, plateauing rather than continuing
+  to grow -- possibly expected re-fitting behavior as more of the surface
+  is actually seen, possibly its own bug; not yet distinguished.
+- **First successful full-pipeline run, 2026-09-14: scan -> detect -> drill
+  chain confirmed end to end, drilling itself still blocked.** `ros2 launch
+  potato_scan potato_drill.launch.py robot_backend:=isaac_sim` (not
+  `scan.launch.py`, which does not include `eye_detector`/`drill_controller`
+  at all -- confirm with `ros2 node list` before assuming a missing trigger
+  is a bug). Manually publishing `/potato_scan/scan_complete` partway through
+  a scan (a full 40+20-view raster is tens of minutes now that views
+  actually settle -- see below) fed a real, partial merged cloud to
+  `eye_detector`, which found 6 candidate eyes (3.5-13.6mm diameter, inside
+  the plausible 2-15mm range) and `drill_controller` received all 6.
+  Publishing `/potato_scan/start_drilling` then drove `_find_reachable_approach`
+  for real: the first two eyes visited each exhausted all 24 roll x tilt
+  candidates and were rejected as `unreachable`, at the genuine ~6s-per-candidate
+  rate settle_timeout_s implies (not the sub-second thrashing the
+  scan-side bug produced, so this is not that same bug back).
+- **Root cause of the unreachable-approach eyes -- found 2026-09-14: the
+  detected NORMAL was ~84 degrees off from the true outward direction, not
+  a `drill_controller`/`approach_candidates` bug.** Added a one-line check
+  (`normal_vs_radial_deg`, comparing the detected normal against
+  `position - potato_center`, which a genuinely convex potato surface point
+  should roughly agree with) and re-ran: the rejected eye's normal was
+  83.6 degrees off, computed from a cluster of only 8 points. An approach
+  built from a normal that wrong asks the arm to insert roughly TANGENT to
+  the surface instead of into it -- unreachable at any roll/tilt, not
+  because the arm or the approach-candidate math is wrong, but because the
+  input it was given was. `drill_task_planner.approach_candidates` is
+  cleared by this: it correctly turned a bad normal into a correctly
+  unreachable pose. The real fix is upstream, distinguishing a real eye's
+  normal (many points, low estimation variance) from a noise direction
+  computed from too few -- not yet built; `cluster_min_points` (currently 8,
+  the same value that just produced this) is the parameter to look at, and
+  the fact that low-point clusters correlate with real drilling failures is
+  now measured, not assumed.
+- **Separately, `eye_detector` had no way to tell a real eye from anything
+  else in the scene with a matching local shape -- found and fixed
+  2026-09-14.** Against the same real cloud above, 4 of 11 "eyes" clustered
+  near [0.04-0.07, 0.03-0.07, ...] -- nowhere near the potato (potato_center
+  was ~[0.48, -0.01, 0.16]) -- because the ROBOT'S OWN BASE happened to
+  satisfy the same curvature+shape-index window `find_eye_candidates` gates
+  on. `potato_center` was already a parameter, but only ever used to orient
+  normals (via `describe_surface`) -- it never restricted which points were
+  even considered. Added `max_center_distance` (`find_eye_candidates`) /
+  `max_expected_radius` (`eye_detector`'s ROS parameter, reusing
+  `scan_controller`'s own name and default of 0.07m -- "larger than the
+  largest potato you'd ever load" already meant exactly what this filter
+  needed) to reject any candidate whose position lands farther than that
+  from `potato_center`. Regression-tested with a synthetic lookalike placed
+  far from the potato (`test_surface_curvature.py`,
+  `test_max_center_distance_rejects_a_lookalike_far_from_the_potato`) --
+  building it took care to place its dimple on the side facing away from
+  `potato_center`, since a dimple facing TOWARD the wrong reference gets its
+  normal auto-orientation flipped and disappears as a dome instead of a
+  cup, which is itself the SAME degradation as the finding above, just
+  encountered while constructing the test rather than in the field.
+- **A full scan is now a multi-minute run, not the sub-minute one the
+  pre-fix thrashing made it look like.** Properly-settled views take several
+  real seconds each (RMPflow settle + point cloud settle), so the full
+  40-view raster plus up to 20 gap-fill views, and then up to 24 approach
+  candidates per eye in drilling, add up fast -- budget accordingly rather
+  than assuming a long-running scan or drill attempt is stuck.
 - **`curvature_min` is tuned on a synthetic**, not a real potato.
 - **The bottom of the potato is not scanned.** The elevation band starts at
   −15°, so eyes near the pin are never found. Deliberate — that end carries

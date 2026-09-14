@@ -107,6 +107,17 @@ class EyeDetector(Node):
         self.declare_parameter('cluster_min_points', 8)
         self.declare_parameter('min_eye_diameter', 0.002)
         self.declare_parameter('max_eye_diameter', 0.015)
+        # Same bound and same default as scan_controller's own
+        # max_expected_radius ("larger than the largest potato you'd ever
+        # load") -- reused here rather than invented fresh, since it already
+        # means exactly what this filter needs: how far from potato_center a
+        # real surface point can plausibly be. CONFIRMED 2026-09-14 this
+        # filter is needed: with no distance gate, 4 of 11 "eyes" detected
+        # against a real Isaac Sim cloud clustered near the ROBOT'S OWN BASE
+        # (curvature+shape-index alone can't tell that apart from a real
+        # eye) -- potato_center only orients normals, it was never used to
+        # restrict which points get considered in the first place.
+        self.declare_parameter('max_expected_radius', 0.07)
 
         self.base_frame = self.get_parameter('base_frame').value
         self.potato_center = np.array(self.get_parameter('potato_center').value, dtype=float)
@@ -119,6 +130,7 @@ class EyeDetector(Node):
         self.cluster_min_points = self.get_parameter('cluster_min_points').value
         self.min_eye_diameter = self.get_parameter('min_eye_diameter').value
         self.max_eye_diameter = self.get_parameter('max_eye_diameter').value
+        self.max_expected_radius = self.get_parameter('max_expected_radius').value
 
         self._latest_cloud_msg = None
         self.create_subscription(PointCloud2, '/potato_scan/merged_cloud', self._on_cloud, 10)
@@ -173,13 +185,16 @@ class EyeDetector(Node):
     def detect_and_publish(self, cloud_msg: PointCloud2):
         has_rgb = any(f.name == 'rgb' for f in cloud_msg.fields)
         fields = ('x', 'y', 'z', 'rgb') if has_rgb else ('x', 'y', 'z')
+        # read_points returns a STRUCTURED array (named dtype fields), not a
+        # plain (N, len(fields)) float array -- see pointcloud_accumulator.py's
+        # matching fix/comment (2026-09-14).
         raw = np.array(list(pc2.read_points(
             cloud_msg, field_names=fields, skip_nans=True)))
         if len(raw) < self.knn + 1:
             self.get_logger().warn('not enough points for eye detection')
             return
-        pts = raw[:, :3]
-        colors = unpack_rgb(raw[:, 3]) if has_rgb else None
+        pts = np.column_stack([raw['x'], raw['y'], raw['z']])
+        colors = unpack_rgb(raw['rgb']) if has_rgb else None
         if colors is None:
             self.get_logger().warn(
                 'merged cloud has no colour, so detection is geometry-only and a soil '
@@ -195,7 +210,8 @@ class EyeDetector(Node):
             cluster_min_points=self.cluster_min_points,
             min_diameter=self.min_eye_diameter,
             max_diameter=self.max_eye_diameter,
-            colors=colors, min_color_contrast=self.min_color_contrast)
+            colors=colors, min_color_contrast=self.min_color_contrast,
+            max_center_distance=self.max_expected_radius)
 
         eyes = [(c['position'], c['normal'], c['diameter']) for c in candidates]
         self.get_logger().info(f'detected {len(eyes)} potato eyes')

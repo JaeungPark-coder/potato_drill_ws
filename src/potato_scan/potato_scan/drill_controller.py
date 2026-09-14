@@ -35,7 +35,6 @@ from std_msgs.msg import Bool
 from geometry_msgs.msg import PoseArray, PointStamped
 from scipy.spatial.transform import Rotation as Rot
 
-from potato_scan.robot_interface import UR5eInterface
 from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 from potato_scan.run_metrics import RunMetrics
 from potato_scan.drill_task_planner import (
@@ -151,6 +150,10 @@ class DrillController(Node):
                 tcp_frame=self.get_parameter('tcp_frame').value,
                 callback_group=self._cb_group)
         else:
+            # Lazy import -- see scan_controller.py's matching comment:
+            # robot_interface.py imports rtde_control at module level, which
+            # is not installed for robot_backend:=isaac_sim.
+            from potato_scan.robot_interface import UR5eInterface
             self.robot = UR5eInterface(
                 self.get_parameter('robot_ip').value,
                 speed=self.get_parameter('approach_speed').value,
@@ -325,7 +328,28 @@ class DrillController(Node):
         for count, idx in enumerate(order):
             position, normal = self._eyes[idx]
 
-            self.get_logger().info(f'[{count + 1}/{len(order)}] approaching eye {idx} at {position}')
+            # A convex potato's surface normal should roughly agree with the
+            # outward radial direction from potato_center -- cheap sanity
+            # check on the normal itself, independent of whether the arm can
+            # reach the pose built from it. CONFIRMED 2026-09-14 this catches
+            # a real failure mode: an eye clustered from only a handful of
+            # points had a normal 83.6deg off (see README's Known gaps), and
+            # every roll/tilt built from it was then, correctly, unreachable
+            # -- the arm and approach_candidates were not the bug.
+            radial = position - self.potato_center
+            radial_norm = np.linalg.norm(radial)
+            radial_dir = radial / radial_norm if radial_norm > 1e-9 else radial
+            normal_vs_radial_deg = np.degrees(
+                np.arccos(np.clip(np.dot(normal, radial_dir), -1.0, 1.0)))
+            self.get_logger().info(
+                f'[{count + 1}/{len(order)}] approaching eye {idx} at {position} '
+                f'normal={np.round(normal, 3)} normal_vs_radial_deg={normal_vs_radial_deg:.1f}')
+            if normal_vs_radial_deg > 45.0:
+                self.get_logger().warn(
+                    f'eye {idx}: normal is {normal_vs_radial_deg:.1f}deg off the outward-radial '
+                    f'direction from potato_center -- likely a noisy normal (few contributing '
+                    f'points), not a reachability problem; an approach built from this may fail '
+                    f'every roll/tilt for a reason that has nothing to do with the arm')
             with metrics.timer('approach'):
                 approach, rotvec, tilt_deg, roll_deg, status = self._find_reachable_approach(
                     position, normal)

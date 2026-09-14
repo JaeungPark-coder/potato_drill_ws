@@ -44,6 +44,7 @@ a different "potato" every run (seed below). The same mesh/robot/sensor
 setup is reused (not reimplemented) by the RL training envs in
 rl_scan_train_env.py / rl_drill_train_env.py, via isaac_sim_common.py.
 """
+import os
 import sys
 import time
 
@@ -51,7 +52,10 @@ import numpy as np
 
 from isaacsim import SimulationApp
 
-simulation_app = SimulationApp({"headless": False})
+# Same toggle as vla_ur5e_ws/isaac/*.py: default headless (works over SSH /
+# no X session), set ISAAC_PICK_PLACE_HEADLESS=0 for an interactive window.
+HEADLESS = os.environ.get("ISAAC_PICK_PLACE_HEADLESS", "1") != "0"
+simulation_app = SimulationApp({"headless": HEADLESS})
 
 # --- everything below must be imported AFTER SimulationApp() starts Kit ---
 import carb
@@ -228,6 +232,23 @@ def main():
     pointcloud_annotator.attach([render_product])
 
     contact_reader = ContactForceReader(drill_tip_path)
+    # CONFIRMED 2026-09-14 (drill_contact_probe.py): without this, the
+    # sensor's readings never leave their constructor default
+    # ({"time": 0, "physics_step": 0}) for the rest of the run, no matter
+    # how hard/long the tip presses into the potato -- the underlying
+    # get_sensor_reading() stays is_valid=False forever. PhysX parses
+    # contact-report registrations (including the one
+    # IsaacSensorCreateContactSensor already applies to drill_tip) when the
+    # physics scene (re)starts; the sensor prim was created well after the
+    # FIRST world.reset() above, so PhysX never saw it. A second reset here,
+    # after every physics-relevant prim for this scene already exists, is
+    # what actually binds it -- re-verified by direct query against
+    # isaacsim.sensors.physics._sensor's own interface, bypassing this
+    # project's ContactForceReader wrapper entirely, so this isn't a
+    # wrapper-level bug. re-initialize the articulation for the same reason
+    # __init__'s own world.reset() above needed a paired robot.initialize().
+    world.reset()
+    robot.initialize()
 
     rclpy.init()
     bridge = IsaacSceneBridge()
@@ -265,11 +286,32 @@ def main():
                 pts = np.asarray(data.get("data", []), dtype=np.float32).reshape(-1, 3)
                 if len(pts) > 0:
                     bridge.publish_cloud(pts)
-    except KeyboardInterrupt:
-        pass
+    except (KeyboardInterrupt, Exception) as e:
+        # A plain SIGTERM (e.g. from `timeout`, or a supervisor stopping this
+        # process) is not a KeyboardInterrupt -- CONFIRMED 2026-09-14: rclpy
+        # installs its own SIGTERM handler that calls context.shutdown() from
+        # inside the signal handler, racing whatever line happens to be
+        # executing. That left rclpy.spin_once() mid-call raising RCLError
+        # ("the given context is not valid"), uncaught here before this fix,
+        # which skipped every cleanup step below and crashed the process
+        # (native SIGSEGV in omni.graph.core.plugin/omni.syntheticdata.plugin
+        # during Py_FinalizeEx) rather than exiting cleanly.
+        if not isinstance(e, KeyboardInterrupt):
+            print(f"isaac_scene.py: shutting down after {e!r}", flush=True)
     finally:
-        bridge.destroy_node()
-        rclpy.shutdown()
+        # Each step guarded independently: rclpy.shutdown() raising (context
+        # already shut down by the race above) must not skip the Replicator
+        # cleanup below it -- CONFIRMED 2026-09-14: leaving the pointcloud
+        # annotator attached and the render product alive when
+        # simulation_app.close() tears down the extension stack is what
+        # produced the native crash, not the rclpy exception itself.
+        for cleanup in (bridge.destroy_node, rclpy.shutdown,
+                        pointcloud_annotator.detach, render_product.destroy):
+            try:
+                cleanup()
+            except Exception as cleanup_error:
+                print(f"isaac_scene.py: cleanup step {cleanup!r} failed: {cleanup_error!r}",
+                      flush=True)
         simulation_app.close()
 
 

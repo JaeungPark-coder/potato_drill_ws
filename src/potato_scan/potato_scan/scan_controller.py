@@ -53,7 +53,7 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from rclpy.qos import (QoSProfile, DurabilityPolicy, ReliabilityPolicy,
                        HistoryPolicy)
 from std_msgs.msg import Bool, Int32
@@ -68,7 +68,6 @@ from potato_scan.camera_ranges import check as check_camera_range
 from potato_scan.run_metrics import PhaseTimer
 from potato_scan.scan_schedule import RasterOrbitSchedule
 from potato_scan.surface_coverage import SurfaceCoverageGrid
-from potato_scan.robot_interface import UR5eInterface
 from potato_scan.isaac_robot_interface import IsaacSimRobotInterface
 
 # Camera roll offsets (degrees, about the optical axis) tried in order when a
@@ -90,6 +89,26 @@ class ScanController(Node):
         # from inside _run_step's own timer callback -- those subscriptions
         # need to run concurrently with _run_step, not queued behind it.
         self._cb_group = ReentrantCallbackGroup()
+        # CONFIRMED 2026-09-14 (isaac_robot_interface.move_to_pose debug
+        # instrumentation): _run_step's own 0.5s timer was ALSO on
+        # _cb_group. ReentrantCallbackGroup.can_execute() returns True
+        # unconditionally, so the executor re-armed and re-entered
+        # _run_step every 0.5s even while the previous call was still
+        # blocked inside move_to_pose's up-to-6s settle wait -- every
+        # "unreachable at every camera roll" in the whole gap-filling sweep
+        # was this, not a real kinematic limit: two-plus concurrent
+        # _run_step calls kept publishing DIFFERENT cartesian targets to
+        # the same robot, so pos_err/rot_err never converged, timing out
+        # at the full 6s with errors of 5-27cm / 68-121deg every time (a
+        # genuinely unreachable pose fails differently -- it plateaus near
+        # its best achievable error, not at an arbitrary large one that
+        # changes with whatever else happened to be running concurrently).
+        # This is the exact bug vla_ur5e_ws's vla_policy_client.py already
+        # hit and fixed (see that project's README) -- the timer needs its
+        # own group so it cannot re-enter itself; the subscriptions
+        # (TF/point_count) stay on the reentrant one so they keep
+        # refreshing while _run_step blocks.
+        self._timer_cb_group = MutuallyExclusiveCallbackGroup()
 
         self.declare_parameter('robot_ip', '192.168.1.100')
         # 'rtde' talks to a real UR5e / URSim over RTDE (robot_interface.
@@ -254,6 +273,12 @@ class ScanController(Node):
                 tcp_frame=self.get_parameter('tcp_frame').value,
                 callback_group=self._cb_group)
         else:
+            # Lazy import: robot_interface.py imports rtde_control at module
+            # level, which is only installed for real-hardware use --
+            # CONFIRMED 2026-09-14, importing it unconditionally at the top
+            # of this file crashed robot_backend:=isaac_sim on startup with
+            # ModuleNotFoundError even though this branch never runs then.
+            from potato_scan.robot_interface import UR5eInterface
             self.robot = UR5eInterface(self.get_parameter('robot_ip').value)
 
         self._last_direction = None
@@ -265,10 +290,16 @@ class ScanController(Node):
         # cannot tell a slow sweep from an awkward potato.
         self.timer = PhaseTimer()
         self._done = False
-        self.create_timer(0.5, self._run_step, callback_group=self._cb_group)
+        self.create_timer(0.5, self._run_step, callback_group=self._timer_cb_group)
 
     def _on_cloud(self, msg: PointCloud2):
-        pts = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
+        # read_points returns a STRUCTURED array (named dtype fields x/y/z),
+        # not a plain (N, 3) float array -- see pointcloud_accumulator.py's
+        # matching fix/comment (2026-09-14) for how this was confirmed
+        # against a real PointCloud2 message. estimate_center/set_from_points
+        # both need a plain float array to do arithmetic on.
+        raw = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
+        pts = np.column_stack([raw['x'], raw['y'], raw['z']]) if raw.size else raw.reshape(0, 3)
         if self.auto_center:
             self._update_potato_center(pts)
         self.coverage.set_from_points(pts, self.potato_center)

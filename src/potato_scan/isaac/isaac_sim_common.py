@@ -191,12 +191,24 @@ class ContactForceReader:
             self._sensor = ContactSensor(
                 prim_path=f"{prim_path}/contact_sensor",
                 name="drill_tip_contact",
-                frequency=60,
+                # dt=-1, not frequency=60: ContactSensor.__init__ converts
+                # frequency with `dt = int(1 / frequency)`, truncating to 0
+                # for any frequency > 1 -- this is passed straight through as
+                # the created prim's sensor_period. Isaac Sim's own shipped
+                # example (isaacsim.sensors.physics.examples/contact_sensor.py)
+                # uses sensor_period=-1, not 0 or a small positive dt; -1
+                # reads every physics step regardless of stage units/rate.
+                dt=-1,
                 translation=np.array([0.0, 0.0, 0.0]),
                 min_threshold=0.0,
                 max_threshold=1000.0,
                 radius=radius,
             )
+            # Not the fix (the dt= above was) but still correct per
+            # BaseSensor.initialize()'s own docstring: a prim only
+            # auto-initializes on world.reset() if it was added via
+            # world.scene.add(...), which this never is.
+            self._sensor.initialize()
             self._ok = True
         except Exception as exc:  # noqa: BLE001 -- best-effort sim sensor setup
             carb.log_warn(

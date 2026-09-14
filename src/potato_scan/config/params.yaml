@@ -143,6 +143,14 @@ eye_detector:
     cluster_min_points: 8
     min_eye_diameter: 0.002
     max_eye_diameter: 0.015
+    # Same value and meaning as scan_controller's max_expected_radius:
+    # "larger than the largest potato you'd ever load". potato_center above
+    # only orients normals, it does not restrict which points get
+    # considered -- CONFIRMED 2026-09-14 that matters against a real cloud,
+    # not just a synthetic one: without this, points on the robot's own
+    # base satisfied the same curvature+shape-index window and were
+    # reported as eyes tens of cm from the potato.
+    max_expected_radius: 0.07
 
 drill_controller:
   ros__parameters:

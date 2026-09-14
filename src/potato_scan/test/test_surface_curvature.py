@@ -239,6 +239,61 @@ def test_each_axis_is_load_bearing_in_a_different_way(potato):
         'dropping curvature costs rejection'
 
 
+# --- 6b. max_center_distance, the gate potato_center alone doesn't provide
+# CONFIRMED 2026-09-14 against a real Isaac Sim cloud that this matters: with
+# no distance gate, 4 of 11 "eyes" detected against a real merged cloud
+# clustered near the ROBOT'S OWN BASE, tens of cm from the potato --
+# curvature and shape index alone can't tell a real eye from anything else
+# in the scene with a matching local shape, and potato_center only orients
+# normals (describe_surface), it never restricted which points were even
+# considered.
+
+@pytest.mark.slow
+def test_max_center_distance_rejects_a_lookalike_far_from_the_potato(potato, rng):
+    points, _, truth = potato
+    stray_center = np.array([0.06, 0.05, 0.16])  # nowhere near CENTER
+    # Same point count as `potato` (not fewer): fibonacci_directions spreads
+    # uniformly over the WHOLE sphere, so fewer points at the same radius
+    # means a sparser cloud, a larger KNN neighbourhood, and curvature that
+    # reads flatter (same non-scale-invariance find_eye_candidates' own
+    # docstring already warns about) -- enough to make the lookalike fail
+    # curvature_min on density alone, which would make this test pass for
+    # the wrong reason.
+    stray_directions = fibonacci_directions(24000)
+    # The dimple has to sit on the side of the stray sphere FACING AWAY from
+    # CENTER. describe_surface orients every normal, including the stray
+    # cluster's, using CENTER (the only potato_center find_eye_candidates is
+    # given) -- so a dimple on the NEAR side gets its true outward normal
+    # flipped to agree with that wrong reference, turning a cup into a dome
+    # (shape_index near 1.0, not 0.0) and silently disappearing regardless
+    # of max_center_distance. That is a real, separate degradation this same
+    # bug causes -- worth knowing about -- but it is not what this test is
+    # for, so the dimple is placed where the flip happens not to matter.
+    dimple_direction = stray_center - CENTER
+    dimple_direction = dimple_direction / np.linalg.norm(dimple_direction)
+    stray_radius, _ = press_dimples(
+        modulated_radius(stray_directions), stray_directions, dimple_direction[None, :])
+    stray_points = stray_center + stray_directions * stray_radius[:, None]
+    stray_points = stray_points + rng.normal(scale=SCANNER_NOISE, size=stray_points.shape)
+    combined = np.vstack([points, stray_points])
+
+    ungated = find_eye_candidates(combined, CENTER, knn=KNN,
+                                  curvature_min=0.015, shape_index_max=0.35)
+    matched_ungated, _ = match(ungated, truth)
+    assert matched_ungated == 4, 'the real eyes should still all be found'
+    assert len(ungated) > 4, (
+        'the stray lookalike should be detected too -- otherwise this test is not '
+        'actually exercising the failure max_center_distance fixes')
+
+    gated = find_eye_candidates(combined, CENTER, knn=KNN,
+                                curvature_min=0.015, shape_index_max=0.35,
+                                max_center_distance=0.07)
+    matched_gated, worst_gated = match(gated, truth)
+    assert matched_gated == 4, 'the real eyes must not be filtered out'
+    assert len(gated) == 4, 'the far-away lookalike must be filtered out'
+    assert worst_gated < 0.002
+
+
 # --- 7. colour, the axis geometry cannot supply --------------------------
 
 @pytest.fixture(scope='module')
