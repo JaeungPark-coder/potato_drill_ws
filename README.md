@@ -53,7 +53,7 @@ separates "my install is wrong" from "my hardware is wrong":
 ```bash
 cd src/potato_scan
 
-# 125 checks over the geometry, planning and detection maths. ~30 s.
+# 127 checks over the geometry, planning and detection maths. ~30 s.
 python -m pytest test/ -q
 
 # the fast subset, if you just want to know the install is sound. ~2 s.
