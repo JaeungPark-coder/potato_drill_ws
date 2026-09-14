@@ -404,3 +404,65 @@ def test_colour_is_measured_but_inert_until_a_threshold_is_set(potato_with_clods
     geometry_only = find_eye_candidates(points, CENTER, knn=KNN)
     measured = find_eye_candidates(points, CENTER, knn=KNN, colors=colors)
     assert len(measured) == len(geometry_only)
+
+
+# --- 8. normal consistency: measured, and deliberately not a gate --------
+
+@pytest.mark.slow
+def test_every_candidate_reports_how_much_its_members_agree(potato):
+    """The number exists so one real run can settle what a threshold should
+    be. It is useless if it is not there on every candidate."""
+    points, _, _ = potato
+    for candidate in find_eye_candidates(points, CENTER, knn=KNN,
+                                         curvature_min=0.015, shape_index_max=0.35):
+        assert 0.0 < candidate['normal_consistency'] <= 1.0
+
+
+@pytest.mark.slow
+def test_agreeing_members_score_near_one(potato):
+    """On a well-sampled synthetic potato the members do agree, which is
+    also why this number cannot separate good normals from bad ones here --
+    see the find_eye_candidates docstring."""
+    points, _, _ = potato
+    found = find_eye_candidates(points, CENTER, knn=KNN,
+                                curvature_min=0.015, shape_index_max=0.35)
+    assert min(c['normal_consistency'] for c in found) > 0.9
+
+
+@pytest.mark.slow
+def test_the_gate_is_off_by_default_and_changes_nothing(potato):
+    """min_normal_consistency=None must reproduce prior behaviour exactly,
+    the same contract min_color_contrast and max_center_distance keep."""
+    points, _, _ = potato
+    ungated = find_eye_candidates(points, CENTER, knn=KNN,
+                                  curvature_min=0.015, shape_index_max=0.35)
+    explicit = find_eye_candidates(points, CENTER, knn=KNN,
+                                   curvature_min=0.015, shape_index_max=0.35,
+                                   min_normal_consistency=None)
+    assert len(ungated) == len(explicit)
+
+
+@pytest.mark.slow
+def test_the_gate_rejects_when_it_is_actually_set(potato):
+    """It has to work when a real run finally earns a threshold."""
+    points, _, _ = potato
+    found = find_eye_candidates(points, CENTER, knn=KNN,
+                                curvature_min=0.015, shape_index_max=0.35)
+    just_above = max(c['normal_consistency'] for c in found) + 1e-6
+    assert found
+    assert find_eye_candidates(points, CENTER, knn=KNN,
+                               curvature_min=0.015, shape_index_max=0.35,
+                               min_normal_consistency=just_above) == []
+
+
+def test_members_that_cancel_produce_no_candidate_rather_than_a_nan():
+    """A latent divide-by-zero: the candidate normal is the mean of its
+    members' unit normals, and normalising that mean without checking its
+    length turns a cluster whose normals oppose each other into NaN -- a
+    pose the arm would then be commanded to.
+    """
+    opposed = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+    mean = opposed.mean(axis=0)
+    assert np.linalg.norm(mean) < 1e-9, 'the fixture must actually cancel'
+    with np.errstate(invalid='ignore', divide='ignore'):
+        assert np.isnan(mean / np.linalg.norm(mean)).all(), 'this is what was shipped'

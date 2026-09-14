@@ -103,6 +103,14 @@ class EyeDetector(Node):
         # is a weak tuber-vs-soil discriminator by itself, good on wet
         # material and doubtful when dry.
         self.declare_parameter('min_color_contrast', -1.0)
+        # Directional agreement among the cluster's member normals, 0..1.
+        # Negative (the default) measures and reports it without rejecting
+        # anything -- deliberately, because no threshold here has been
+        # earned yet: on synthetic clouds this number does NOT predict how
+        # wrong the normal is (see surface_curvature.find_eye_candidates).
+        # It is logged next to drill_controller's normal_vs_radial_deg so
+        # one real run produces the pairs a threshold could be set from.
+        self.declare_parameter('min_normal_consistency', -1.0)
         self.declare_parameter('cluster_eps', 0.003)
         self.declare_parameter('cluster_min_points', 8)
         self.declare_parameter('min_eye_diameter', 0.002)
@@ -126,6 +134,9 @@ class EyeDetector(Node):
         self.shape_index_max = self.get_parameter('shape_index_max').value
         min_contrast = self.get_parameter('min_color_contrast').value
         self.min_color_contrast = None if min_contrast < 0.0 else min_contrast
+        min_consistency = self.get_parameter('min_normal_consistency').value
+        self.min_normal_consistency = (
+            None if min_consistency < 0.0 else min_consistency)
         self.cluster_eps = self.get_parameter('cluster_eps').value
         self.cluster_min_points = self.get_parameter('cluster_min_points').value
         self.min_eye_diameter = self.get_parameter('min_eye_diameter').value
@@ -211,7 +222,8 @@ class EyeDetector(Node):
             min_diameter=self.min_eye_diameter,
             max_diameter=self.max_eye_diameter,
             colors=colors, min_color_contrast=self.min_color_contrast,
-            max_center_distance=self.max_expected_radius)
+            max_center_distance=self.max_expected_radius,
+            min_normal_consistency=self.min_normal_consistency)
 
         eyes = [(c['position'], c['normal'], c['diameter']) for c in candidates]
         self.get_logger().info(f'detected {len(eyes)} potato eyes')
@@ -219,7 +231,8 @@ class EyeDetector(Node):
             self.get_logger().info(
                 f"  #{i} at {np.round(c['position'], 4)} diameter "
                 f"{c['diameter'] * 1000:.1f}mm shape_index {c['shape_index']:.3f} "
-                f"({c['points']} points)"
+                f"({c['points']} points) "
+                f"normal_consistency {c['normal_consistency']:.4f}"
                 + ('' if colors is None else
                    f" colour_contrast {c['color_contrast']:+.3f} "
                    f"(vs {c['surround_points']} surround pts)"))

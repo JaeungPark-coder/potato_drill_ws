@@ -139,6 +139,13 @@ eye_detector:
     # seen on real potatoes. On a synthetic where clods share the eyes'
     # geometry exactly, eyes came out near +0.55 and clods near +0.02.
     min_color_contrast: -1.0
+    # Directional agreement among a cluster's member normals, 0..1.
+    # Negative = measure and log it, reject nothing. Left off on purpose:
+    # no threshold is earned yet (on synthetic clouds this does NOT predict
+    # normal error -- see surface_curvature.find_eye_candidates). Read it in
+    # the eye_detector log next to drill_controller's normal_vs_radial_deg
+    # from one real run, then set it from those pairs.
+    min_normal_consistency: -1.0
     cluster_eps: 0.003
     cluster_min_points: 8
     min_eye_diameter: 0.002

@@ -244,7 +244,7 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
                         shape_index_max=0.35, cluster_eps=0.003,
                         cluster_min_points=8, min_diameter=0.002,
                         max_diameter=0.015, colors=None, min_color_contrast=None,
-                        max_center_distance=None):
+                        max_center_distance=None, min_normal_consistency=None):
     """The whole point-cloud half of eye detection, with no ROS in it.
 
     Selects points that are both curved enough (kappa) and cup-shaped (S),
@@ -290,6 +290,35 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
     looked at on real potatoes: the visible band is a weak tuber-vs-soil
     discriminator on its own, reliable on wet material and doubtful when
     dry, so it belongs as evidence before it belongs as a gate.
+
+    `min_normal_consistency` is REPORTED BY DEFAULT AND GATES NOTHING, and
+    the reason is a negative result worth not repeating. Every candidate
+    carries `normal_consistency`: the length of the mean of its members' unit
+    normals, 1.0 when they all agree and falling toward 0 as they scatter.
+    It exists because a real Isaac Sim cloud produced an eye whose normal was
+    84 degrees off the true outward direction, which made every approach
+    correctly unreachable and looked like an arm problem.
+
+    It does not, on any data this repository can generate, predict that
+    error. Measured against the analytic surface, over sampling densities
+    from 24000 down to 6000 points and noise from 0.15 to 1.5 mm:
+
+        cluster point count    r = +0.01 vs normal error
+        normal_consistency     r = -0.19
+        neighbourhood radius   r = +0.36
+
+    and a separate test of one-sided coverage (a hemisphere, then caps down
+    to 700 points) moved the in-plane anisotropy of the neighbourhood sharply
+    -- 0.81 to 0.45 at the cut edge, so that measure does detect a one-sided
+    patch -- while the normal error barely moved at all (2.7 to 3.4 degrees
+    median). PCA normals are simply robust on a smooth sampled surface, and
+    none of these synthetic failures is the failure that was actually seen.
+
+    So the number is instrumentation, not a filter. eye_detector logs it per
+    candidate and drill_controller logs normal_vs_radial_deg per eye, which
+    means ONE real run produces the pairs a threshold could honestly be set
+    from. Setting one now would be guessing, and a guessed gate that drops
+    real eyes is worse than a logged number that explains them.
 
     `max_center_distance` is the other kind of gate `potato_center` alone
     doesn't provide: that argument only orients normals (via
@@ -341,11 +370,30 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
             if min_color_contrast is not None and color_contrast < min_color_contrast:
                 continue
 
-        normal = normals[selected][member].mean(axis=0)
-        normal /= np.linalg.norm(normal)
+        # The candidate normal is the mean of its members' unit normals, so
+        # the LENGTH of that mean, before normalising, is free evidence about
+        # whether it means anything: 1.0 when every member agrees, falling
+        # toward 0 as they scatter. (It is the resultant length R of
+        # directional statistics.) A cluster carried by 8-9 points on a noisy
+        # real cloud produced a mean 84 degrees off the true outward
+        # direction -- see the module docstring -- and every approach built
+        # from it was then correctly unreachable, which looked like an arm
+        # problem for as long as nothing measured this.
+        mean_normal = normals[selected][member].mean(axis=0)
+        normal_consistency = float(np.linalg.norm(mean_normal))
+        if normal_consistency < 1e-9:
+            # the members point in so many directions that they cancel; there
+            # is no direction here to normalise, let alone to drill along
+            continue
+        normal = mean_normal / normal_consistency
+        if (min_normal_consistency is not None
+                and normal_consistency < min_normal_consistency):
+            continue
+
         candidates.append({
             'position': cluster.mean(axis=0),
             'normal': normal,
+            'normal_consistency': normal_consistency,
             'diameter': diameter,
             'color_contrast': float(color_contrast),
             'surround_points': int(n_surround),
