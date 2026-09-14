@@ -53,7 +53,7 @@ separates "my install is wrong" from "my hardware is wrong":
 ```bash
 cd src/potato_scan
 
-# 132 checks over the geometry, planning and detection maths. ~30 s.
+# 151 checks over the geometry, planning and detection maths. ~30 s.
 python -m pytest test/ -q
 
 # the fast subset, if you just want to know the install is sound. ~2 s.
@@ -147,6 +147,41 @@ go to.
 
 Stop it with Ctrl+C, or let a supervisor send SIGTERM -- either is safe as
 of the shutdown fix below.
+
+### Scoring the detector against eyes you actually know
+
+`isaac_sim_common.make_potato_mesh` has always returned the world position
+and outward normal of every pit it carves, and `isaac_scene.py` used to
+discard them. It now publishes them, latched, on
+`/potato_scan/ground_truth_eyes`, and:
+
+```bash
+ros2 run potato_scan detection_accuracy_check
+```
+
+scores `eye_detector`'s output against them each time it publishes:
+
+```
+detection accuracy vs ground truth
+  found        : 3/3  (recall 100%)
+  position     : mean 2.10mm worst 4.00mm (target 2mm -- OVER TARGET)
+  normal       : mean 29.0deg worst 84.2deg (warn 45deg -- OVER WARN)
+
+    eye 0 <- detection 0:  0.80mm  normal   0.0deg
+    eye 2 <- detection 2:  4.00mm  normal  84.2deg
+```
+
+Position and normal are reported separately on purpose. The 2026-09-14 run
+found six plausible-looking candidates and could not drill two of them, and
+establishing that the NORMALS were wrong rather than the positions took a
+separate investigation; this answers it in one run.
+
+**This does not replace step 5.** The simulator renders depth with no sensor
+noise, no specularity, and no dropout in the dark pocket an eye actually is,
+so clearing the 2 mm target here is necessary and nowhere near sufficient.
+What it changes is that the question no longer needs hardware to *ask*, so
+thresholds (step 4) can be tuned against a number instead of against a
+plausible-looking count.
 
 ## Bring-up order
 

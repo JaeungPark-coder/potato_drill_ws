@@ -72,12 +72,19 @@ enable_extension("isaacsim.ros2.bridge")  # makes rclpy importable/usable in thi
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, WrenchStamped, TransformStamped
+from geometry_msgs.msg import (
+    Pose, PoseArray, PoseStamped, WrenchStamped, TransformStamped)
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header
 import tf2_ros
 from scipy.spatial.transform import Rotation as Rot
+
+# the single definition of the +Z-is-outward-normal convention; the
+# detector publishes eyes in it too, which is what makes the two
+# PoseArrays comparable without either side restating the rule
+from potato_scan.drill_task_planner import normal_rotation
 
 # Scene-building helpers (potato mesh, drill tip, contact sensor, RMPflow
 # setup, world-pose readout) live in isaac_sim_common.py, shared with the
@@ -100,6 +107,7 @@ POTATO_SEED = None                             # None -> random potato shape eac
 CAMERA_TOPIC = "/camera/depth/color/points"
 TARGET_POSE_TOPIC = "/isaac_sim/cartesian_target"
 WRENCH_TOPIC = "/isaac_sim/drill_tip/wrench"
+GROUND_TRUTH_EYES_TOPIC = "/potato_scan/ground_truth_eyes"
 CLOUD_PUBLISH_PERIOD_S = 1.0
 
 
@@ -112,11 +120,44 @@ class IsaacSceneBridge(Node):
         super().__init__('isaac_scene_bridge')
         self.cloud_pub = self.create_publisher(PointCloud2, CAMERA_TOPIC, 10)
         self.wrench_pub = self.create_publisher(WrenchStamped, WRENCH_TOPIC, 10)
+        # Latched: the potato is carved once at startup, long before
+        # eye_detector or detection_accuracy_check are up. Without
+        # TRANSIENT_LOCAL the one message would be sent to nobody.
+        self.truth_pub = self.create_publisher(
+            PoseArray, GROUND_TRUTH_EYES_TOPIC,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE))
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
         self.latest_target_pos = POTATO_CENTER.copy()
         self.latest_target_rotvec = np.array([0.0, np.pi, 0.0])  # pointing down, arbitrary default
         self.create_subscription(PoseStamped, TARGET_POSE_TOPIC, self._on_target, 10)
+
+    def publish_ground_truth_eyes(self, eye_points, eye_normals):
+        """Where the pits actually are, straight from the mesh that carved them.
+
+        make_potato_mesh has always returned this and isaac_scene has always
+        discarded it, which left "is a detected eye in the right place?"
+        answerable only with a real robot and callipers (bring-up step 5).
+        It is answerable here, now, for free -- and unlike the callipers it
+        also gives the true outward NORMAL, which is what the 84-degree
+        failure of 2026-09-14 turned on.
+        """
+        msg = PoseArray()
+        msg.header.frame_id = BASE_FRAME
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for position, normal in zip(eye_points, eye_normals):
+            pose = Pose()
+            pose.position.x, pose.position.y, pose.position.z = (float(v) for v in position)
+            # same +Z-is-the-outward-normal convention eye_detector publishes,
+            # from the one definition of it, so the two are comparable at all
+            q = Rot.from_matrix(normal_rotation(normal)).as_quat()   # x, y, z, w
+            pose.orientation.x, pose.orientation.y = float(q[0]), float(q[1])
+            pose.orientation.z, pose.orientation.w = float(q[2]), float(q[3])
+            msg.poses.append(pose)
+        self.truth_pub.publish(msg)
+        self.get_logger().info(
+            f'published {len(msg.poses)} ground-truth eyes on {GROUND_TRUTH_EYES_TOPIC}')
 
     def _on_target(self, msg: PoseStamped):
         self.latest_target_pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
@@ -178,7 +219,8 @@ def main():
     world.reset()  # initializes physics handles for the articulation
     robot.initialize()
 
-    make_potato_mesh(stage, "/World/potato", POTATO_CENTER, seed=POTATO_SEED)
+    _, eye_points, eye_normals = make_potato_mesh(
+        stage, "/World/potato", POTATO_CENTER, seed=POTATO_SEED)
 
     tool_prim = stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH)
     if not tool_prim.IsValid():
@@ -252,6 +294,9 @@ def main():
 
     rclpy.init()
     bridge = IsaacSceneBridge()
+    # Latched, so it is published once here and still reaches eye_detector
+    # or detection_accuracy_check whenever they start.
+    bridge.publish_ground_truth_eyes(eye_points, eye_normals)
 
     last_cloud_time = 0.0
     physics_dt = 1.0 / 60.0

@@ -31,6 +31,7 @@ setup(
             'handeye_calibration = potato_scan.handeye_calibration:main',
             'force_drill_tuner = potato_scan.force_drill_tuner:main',
             'calliper_check = potato_scan.calliper_check:main',
+            'detection_accuracy_check = potato_scan.detection_accuracy_check:main',
         ],
     },
 )
