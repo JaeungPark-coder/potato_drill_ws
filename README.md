@@ -84,6 +84,100 @@ brings it) and nothing else — no ROS, no Open3D, no robot. It is the same
 suite `colcon test` runs.
 
 
+## The next Isaac Sim session, in order
+
+Everything below runs in the simulator. None of it needs a robot, a camera or
+a potato. Do them in this order: step 0 costs 30 seconds and every later step
+is built on it.
+
+### 0. Confirm the scene still starts
+
+`isaac_scene.py` imports `potato_scan.drill_task_planner` for the one
+definition of the outward-normal convention, and that import resolves only
+because the file inserts its own parent on `sys.path`. It has to: this script
+runs under Kit's interpreter with ROS 2 deliberately **not** sourced (see
+below), so neither the workspace nor the installed package is on the path by
+default. That path insert has not itself been run yet.
+
+Launch the scene exactly as in the next section. You are looking for two
+lines, in this order:
+
+```
+published N ground-truth eyes on /potato_scan/ground_truth_eyes
+```
+
+| what you see | what it means |
+|---|---|
+| `ModuleNotFoundError: No module named 'potato_scan'` | the path insert is wrong for your layout. Nothing downstream can work; fix this first |
+| the scene starts but no `published N ground-truth eyes` line | the scene predates the ground-truth wiring, or `make_potato_mesh` carved no pits |
+| both lines, then the usual idle | good. Leave it running and go to step 1 |
+
+### 1. Get a real number for detection accuracy
+
+In a second terminal (this one **does** want the workspace sourced):
+
+```bash
+source install/setup.bash
+ros2 run potato_scan detection_accuracy_check &
+ros2 launch potato_scan potato_drill.launch.py robot_backend:=isaac_sim
+```
+
+Use `potato_drill.launch.py`, not `scan.launch.py` — only the former starts
+`eye_detector` and `drill_controller`. Confirm with `ros2 node list` before
+assuming a missing trigger is a bug.
+
+A full 40+20-view raster takes tens of minutes now that views actually
+settle. To get an answer sooner, publish `scan_complete` partway through and
+score the partial cloud; the numbers are then about a partial scan, which is
+worth writing down next to them.
+
+```bash
+ros2 topic pub --once /potato_scan/scan_complete std_msgs/msg/Bool "{data: true}"
+```
+
+`detection_accuracy_check` prints on every detection:
+
+```
+  position     : mean 2.10mm worst 4.00mm (target 2mm -- OVER TARGET)
+  normal       : mean 29.0deg worst 84.2deg (warn 45deg -- OVER WARN)
+```
+
+Read the two lines separately. They are separate failures with separate
+fixes, and telling them apart by hand took its own investigation on
+2026-09-14:
+
+| position | normal | what it is |
+|---|---|---|
+| ok | ok | detection is sound; anything left is the arm or the fixture |
+| ok | OVER WARN | the 84-degree case. The eye is found, the approach direction is not. Look at `normal_consistency` in the `eye_detector` log for the same eye |
+| OVER TARGET | either | the cluster centre is off. `curvature_min` / `shape_index_max` (step 4 below) |
+| missed / spurious | — | a threshold problem, not a precision one. Same two parameters |
+
+### 2. Pair the normal errors with the confidence number
+
+`eye_detector` logs `normal_consistency` per candidate and
+`drill_controller` logs `normal_vs_radial_deg` per eye. They join by eye
+index. One run gives enough pairs to decide whether
+`min_normal_consistency` (shipped off, in `config/params.yaml`) is worth
+setting and to what — which cannot honestly be decided from synthetic data,
+where the number does not predict the error at all.
+
+### 3. Only then, the drill
+
+```bash
+ros2 topic pub --once /potato_scan/start_drilling std_msgs/msg/Bool "{data: true}"
+```
+
+Drilling has never completed in simulation: on 2026-09-14 the first two eyes
+visited were both rejected as `unreachable`, and step 1 above is what says
+whether that is fixed. Each eye takes about 6 s per candidate across 24
+roll x tilt candidates, so a rejected eye is roughly 2.5 minutes of genuine
+search, not a hang.
+
+A `reached` outcome on one eye is the first real evidence the whole chain
+works. Everything before this point has been verified; this has not.
+
+
 ## Running against Isaac Sim instead of real hardware
 
 `isaac/isaac_scene.py` stands in for the robot and the camera --
