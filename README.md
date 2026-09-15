@@ -71,6 +71,17 @@ print(check('d435', 0.15, 0.07)[1])"
 If those run, the geometry half of the package is working and anything that
 breaks later is ROS, hardware, or calibration.
 
+**If `python -m pytest` instead dies on `ModuleNotFoundError: No module named
+'lark'`, inside `launch_testing`/`launch`, not inside this package** -- that
+is pytest auto-loading every installed `pytest11` plugin, ROS 2's own
+`launch_testing`/`launch_ros`/`ament_lint` included, because this is normally
+run in a shell with ROS already sourced (this workspace needs it for
+`colcon build`). One of those imports `lark`, which ROS's apt packages don't
+pull in. `setup.cfg`'s `addopts` now disables those plugins by name, so the
+command above is safe to run in the same shell you built the workspace in
+-- confirmed 2026-09-15 with Humble sourced and an Isaac conda env's Python
+ahead on `PATH`, the actual shell this machine runs both in.
+
 The suite is worth a second look rather than just a green tick: each test is
 named for the property it holds, and several exist because the property
 failed once. `test_orientation.py` holds the drill pointing into the potato
