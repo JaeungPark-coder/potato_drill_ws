@@ -19,28 +19,52 @@ follow from the units alone:
     threshold was separating signal from noise by magnitude rather than by
     shape.
 
-This module uses two dimensionless quantities instead, which between them
-say something the single score could not.
+This module asks two questions instead -- how curved, and which way --
+which between them say something the single score could not.
 
-SURFACE VARIATION (kappa), "how curved"
+MEAN CURVATURE (H), "how curved" -- the gate
+
+    H = (k1 + k2) / 2,   in 1/metres
+
+from the two principal curvatures of a quadratic patch fitted to each
+neighbourhood (principal_curvatures below). This is the physical curvature
+of the surface, so a threshold on it is a radius of curvature -- 150/m is
+"bends tighter than a 6.7 mm sphere" -- and it is set from what an eye IS,
+not from how the scan was taken. Measured on the simulated potato, an eye
+pit reads 130-300/m and the body -24/m at the median, +18 to +68/m at its
+99th percentile: a 3-10x gap, on which the threshold sits with room on both
+sides. With outward normals a convex body is negative and a pit positive,
+so the gate is one-sided.
+
+It replaced kappa as the gate on 2026-09-16, for a measured reason: see
+the next section.
+
+SURFACE VARIATION (kappa), "how curved" -- reported, no longer gating
 
 From the eigenvalues of the neighbourhood's covariance, lambda0 <= lambda1
 <= lambda2:
 
     kappa = lambda0 / (lambda0 + lambda1 + lambda2)
 
-Zero on a plane, 1/3 when the neighbourhood is isotropic. Being a ratio it
-is dimensionless and bounded, so a threshold on it is a fixed number in a
-known range rather than a length that has to be re-derived per setup.
+Zero on a plane, 1/3 when the neighbourhood is isotropic. Dimensionless and
+bounded, which is why it replaced the original concavity score (an offset
+in metres sitting at the sensor's noise floor).
 
-It is NOT scale-invariant, though, and it is worth being precise about that:
-with a fixed `knn`, a denser scan means a smaller neighbourhood, which looks
-flatter, which lowers kappa. Measured on spheres of one radius sampled at
-three densities, the median kappa went 0.0016 -> 0.0006 -> 0.0002 as spacing
-went 2.3 -> 1.4 -> 0.9 mm. So kappa still has to be set for the scan density
-in use; what it buys over a distance in metres is a bounded, interpretable
-range and independence from the sensor's noise floor -- not immunity to
-density.
+It is NOT scale-invariant, and that turned out to be decisive. With a fixed
+`knn`, a denser scan means a smaller neighbourhood, which looks flatter,
+which lowers kappa: on spheres of one radius the median went 0.0016 ->
+0.0006 -> 0.0002 as spacing went 2.3 -> 1.4 -> 0.9 mm. And lambda0 is also
+where sensor noise lives, so a noise floor raises kappa on the whole
+surface at once. On the simulated potato at 1 mm spacing a nominal eye
+measured kappa 0.010-0.016, straddling the 0.015 threshold, while the
+noise floor alone put the 90th percentile at 0.007 (0.15 mm noise), 0.012
+(0.20 mm) and 0.018 (0.25 mm) -- past the threshold. Over 30 potatoes
+that meant 11-59% of eyes found and then, at 0.25 mm, 2232 spurious
+candidates; the same clouds gated on H > 150/m gave 42-85% found and 0
+spurious at every noise level up to 0.25 mm (sim_detection_check has the
+table). kappa is still computed and reported, because the detector node's
+percentile log is how a scan's density and noise get read, and
+`curvature_min` still exists for anyone who wants it back as a gate.
 
 SHAPE INDEX (S), "which way curved"
 
@@ -57,10 +81,12 @@ KIND of shape, which is what separates an eye from the lump it sits on:
     S ~ 0.75   ridge    a raised ridge       <- a surface bump
     S ~ 1.00   dome     convex               <- the potato's own body
 
-Curvature alone cannot separate the last two from the first: a sharp ridge
-and a sharp pit have similar kappa. Their shape indices are at opposite ends.
-So the detector asks for both -- curved enough (kappa) AND cup-shaped (S) --
-where it used to ask only "is the neighbourhood centroid offset far enough".
+Curvature magnitude alone cannot separate the last two from the first: a
+sharp ridge and a sharp pit are both curved. Their shape indices are at
+opposite ends, and H's sign only half-separates them (a ridge has one
+negative curvature and one near zero). So the detector asks for both --
+curved enough (H) AND cup-shaped (S) -- where it used to ask only "is the
+neighbourhood centroid offset far enough".
 
 SIGN CONVENTION
 
@@ -70,6 +96,8 @@ eye as a cup (S ~ 0). Flip the normals and the whole scale inverts, so
 estimate_normals takes the potato centre and orients against it rather than
 leaving the eigenvector's arbitrary sign in place.
 """
+from typing import NamedTuple
+
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -225,32 +253,53 @@ def dbscan(points, eps, min_points):
     return labels
 
 
+class SurfaceDescription(NamedTuple):
+    """Per-point local shape, one row per input point."""
+    normals: np.ndarray          # (N, 3) unit, outward
+    kappa: np.ndarray            # surface variation, dimensionless
+    shape_index: np.ndarray      # 0 cup .. 1 dome
+    mean_curvature: np.ndarray   # H, 1/m, positive for a pit
+    thickness: np.ndarray        # sqrt(lambda0), metres: the neighbourhood's
+                                 # spread along its own normal -- on a
+                                 # smooth surface this IS the noise floor
+
+
 def describe_surface(points, potato_center, knn=30):
     """Everything the detector needs about local shape, in one pass over the
-    neighbourhood graph: (normals, kappa, shape_index).
+    neighbourhood graph.
 
-    Computed together because all three share the same KD-tree query and the
-    same neighbour indices, which dominate the cost.
+    Computed together because all of it shares the same KD-tree query and
+    the same neighbour indices, which dominate the cost.
     """
     idx = neighbor_indices(points, knn)
     eigenvalues, eigenvectors = neighborhood_eigen(points, idx)
     normals = estimate_normals(points, idx, eigenvectors, potato_center)
     kappa = surface_variation(eigenvalues)
     k1, k2 = principal_curvatures(points, idx, normals)
-    return normals, kappa, shape_index(k1, k2)
+    return SurfaceDescription(
+        normals=normals, kappa=kappa, shape_index=shape_index(k1, k2),
+        mean_curvature=0.5 * (k1 + k2),
+        thickness=np.sqrt(np.maximum(eigenvalues[:, 0], 0.0)))
 
 
-def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
-                        shape_index_max=0.35, cluster_eps=0.003,
-                        cluster_min_points=8, min_diameter=0.002,
-                        max_diameter=0.015, colors=None, min_color_contrast=None,
-                        max_center_distance=None, min_normal_consistency=None):
+def find_eye_candidates(points, potato_center, knn=30, mean_curvature_min=150.0,
+                        curvature_min=None, shape_index_max=0.35,
+                        cluster_eps=0.003, cluster_min_points=8,
+                        min_diameter=0.002, max_diameter=0.015, colors=None,
+                        min_color_contrast=None, max_center_distance=None,
+                        min_normal_consistency=None):
     """The whole point-cloud half of eye detection, with no ROS in it.
 
-    Selects points that are both curved enough (kappa) and cup-shaped (S),
-    clusters the survivors, and keeps clusters whose extent looks like an
-    eye. Returns a list of (position, outward_normal, diameter) with the
-    strongest-scoring candidates first.
+    Selects points that are both curved enough (mean curvature H) and
+    cup-shaped (S), clusters the survivors, and keeps clusters whose extent
+    looks like an eye. Returns a list of candidate dicts with the
+    strongest-scoring first.
+
+    `mean_curvature_min` is the gate, in 1/m: 150 means the surface has to
+    bend tighter than a 6.7 mm sphere, inward. `curvature_min` is the kappa
+    gate it replaced (2026-09-16 -- the module docstring has the numbers),
+    off by default; either may be None to disable it, and both apply if
+    both are set.
 
     Two axes rather than one is the substance here: a threshold on curvature
     alone cannot tell a pit from the ridge beside it, because both are
@@ -262,20 +311,24 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
 
     The two axes do different jobs, measured by ablation on a synthetic
     potato (24000 points on a 35 mm body at ~0.9 mm spacing -- close to what
-    a 1 mm voxel grid gives -- with four 3.5 mm-deep dimples):
+    a 1 mm voxel grid gives -- with four 3.5 mm-deep dimples), originally
+    with kappa as the curvature axis:
 
         both axes      4/4 eyes found, 0 false, worst position error 0.7 mm
         kappa only     4/4 found, 0 false, but error grows to 2.4 mm
         shape only     10 candidates, 1/4 found, 9 false
 
-    So kappa is what rejects, and the shape index is what localises: without
-    it the cluster spreads off the cup and the centre drifts. Defaults come
-    from that sweep.
+    So curvature is what rejects, and the shape index is what localises:
+    without it the cluster spreads off the cup and the centre drifts. The
+    same holds with H as the curvature axis (test_surface_curvature.py).
 
-    curvature_min has to be re-set for the scan density actually in use (see
-    the module docstring on why kappa is not scale-invariant), and 0.015 is
-    validated against a synthetic, not against a real potato -- treat it as
-    a starting point and check the logged percentiles on a real scan.
+    150/m was chosen on the simulated potato over 30 seeds and five noise
+    levels: 100/m finds more eyes (93% at 0.15 mm noise) but starts
+    admitting noise at 0.20 mm; 150/m holds 0 spurious through 0.25 mm at
+    42-85% found; 200/m is clean but misses most shallow eyes. A real
+    potato's eyes are not Gaussian pits, so this is a starting point to
+    check against the H percentiles eye_detector logs -- but it is a
+    starting point in the surface's own units, which kappa's never was.
     shape_index_max needs no such tuning: 0.35 keeps cups and ruts and
     rejects saddles, ridges and domes at any scale.
 
@@ -338,8 +391,13 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
     if len(points) < knn + 1:
         return []
 
-    normals, kappa, s_index = describe_surface(points, potato_center, knn=knn)
-    selected = (kappa > curvature_min) & (s_index < shape_index_max)
+    surface = describe_surface(points, potato_center, knn=knn)
+    normals, s_index = surface.normals, surface.shape_index
+    selected = s_index < shape_index_max
+    if mean_curvature_min is not None:
+        selected &= surface.mean_curvature > mean_curvature_min
+    if curvature_min is not None:
+        selected &= surface.kappa > curvature_min
     if not np.any(selected):
         return []
 
@@ -401,6 +459,7 @@ def find_eye_candidates(points, potato_center, knn=30, curvature_min=0.015,
             # pit, and it is the natural ranking when more candidates come
             # back than a potato plausibly has eyes
             'shape_index': float(s_index[selected][member].mean()),
+            'mean_curvature': float(surface.mean_curvature[selected][member].mean()),
             'points': int(member.sum()),
         })
 

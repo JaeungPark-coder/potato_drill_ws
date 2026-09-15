@@ -178,6 +178,30 @@ def test_what_is_found_is_found_where_it_is():
 
 
 @pytest.mark.slow
+def test_the_mean_curvature_gate_survives_the_noise_that_breaks_kappa():
+    """Why the gate changed on 2026-09-16. At 0.25mm of scanner noise the
+    kappa floor crosses 0.015 and the old gate accepts the whole surface;
+    H is the fitted physical curvature and the same clouds stay clean.
+    Three potatoes rather than thirty, so the fast suite is not slowed by
+    a result the tool reproduces at full size in seconds."""
+    kappa_gate = dict(sim_detection_check.DEFAULTS, mean_curvature_min=None, curvature_min=0.015)
+    spurious_kappa = spurious_h = found_h = 0
+    for seed in range(3):
+        geometry = generate(CENTER, seed=seed)
+        surface = sample_surface(geometry, noise=0.00025, rng=seed)
+        old = find_eye_candidates(surface, CENTER, **kappa_gate)
+        new = find_eye_candidates(surface, CENTER, **sim_detection_check.DEFAULTS)
+        spurious_kappa += len(match_detections([c['position'] for c in old],
+                                               geometry.eye_points)['spurious'])
+        result = match_detections([c['position'] for c in new], geometry.eye_points)
+        spurious_h += len(result['spurious'])
+        found_h += len(result['matches'])
+    assert spurious_kappa > 20
+    assert spurious_h == 0
+    assert found_h > 0
+
+
+@pytest.mark.slow
 def test_the_check_tool_runs_both_ways(capsys):
     sim_detection_check.main(['--seeds', '2'])
     sim_detection_check.main(['--seed', '0'])

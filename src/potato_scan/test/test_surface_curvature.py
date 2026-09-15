@@ -145,7 +145,7 @@ def described(potato):
 @pytest.mark.slow
 def test_the_body_reads_as_ridge_to_dome_and_an_eye_as_a_cup(potato, described):
     _, is_eye, _ = potato
-    _, _, s = described
+    s = described.shape_index
     body, eye = np.median(s[~is_eye]), np.median(s[is_eye])
     assert body > 0.6
     assert eye < 0.4
@@ -154,9 +154,10 @@ def test_the_body_reads_as_ridge_to_dome_and_an_eye_as_a_cup(potato, described):
 
 @pytest.mark.slow
 def test_the_shape_index_buys_precision_curvature_alone_cannot(potato, described):
-    """The reason the filter has two axes rather than one."""
+    """The reason the filter has two axes rather than one (with kappa as
+    the curvature axis, as it was when this was established)."""
     _, is_eye, _ = potato
-    _, kappa, s = described
+    kappa, s = described.kappa, described.shape_index
     curvature_min, shape_index_max = 0.002, 0.4
 
     def precision(selected):
@@ -208,10 +209,9 @@ def match(found, truth, tolerance=0.008):
 
 
 @pytest.mark.slow
-def test_both_axes_find_every_eye_with_no_false_positives(potato):
+def test_the_default_gate_finds_every_eye_with_no_false_positives(potato):
     points, _, truth = potato
-    found = find_eye_candidates(points, CENTER, knn=KNN,
-                                curvature_min=0.015, shape_index_max=0.35)
+    found = find_eye_candidates(points, CENTER, knn=KNN)
     matched, worst = match(found, truth)
     assert matched == 4
     assert len(found) == 4
@@ -219,24 +219,56 @@ def test_both_axes_find_every_eye_with_no_false_positives(potato):
 
 
 @pytest.mark.slow
-def test_each_axis_is_load_bearing_in_a_different_way(potato):
-    """kappa rejects, the shape index localises. Dropping either costs
-    something, and they are not the same something."""
+def test_the_eyes_are_an_order_of_magnitude_more_curved_than_the_body(potato, described):
+    """What the mean-curvature gate rests on: H is the surface's physical
+    curvature, positive inward with outward normals, and a 3.5 mm pit of
+    sigma 3 mm bends at roughly depth / sigma^2 ~ 350/m, where a 35 mm
+    body bends at -1/R ~ -29/m. The 150/m default sits between them with
+    room on both sides -- and that room is in 1/m, not in a quantity that
+    moves with scan density."""
+    _, is_eye, _ = potato
+    h = described.mean_curvature
+    assert np.median(h[~is_eye]) < 0.0, 'the body is convex: negative H'
+    assert np.percentile(h[~is_eye], 99) < 150.0
+    assert np.percentile(h[is_eye], 75) > 150.0
+
+
+@pytest.mark.slow
+def test_curvature_rejects_and_the_shape_index_is_the_saddle_guard(potato):
+    """Curvature is what rejects: on the shape index alone most of what
+    comes back is not an eye. With kappa as the curvature axis the shape
+    index was also what localised (kappa-only drifted to 2.4 mm); with a
+    SIGNED mean curvature the ridges and domes it used to remove are
+    already negative, so on a potato of Gaussian pits H alone lands where
+    both axes do. S stays for what H's sign cannot see -- a saddle can
+    have H well above 150/m -- and because it costs nothing here."""
     points, _, truth = potato
-    both = find_eye_candidates(points, CENTER, knn=KNN,
-                               curvature_min=0.015, shape_index_max=0.35)
+    both = find_eye_candidates(points, CENTER, knn=KNN)
     matched, worst = match(both, truth)
+    assert matched == 4 and worst < 0.002
 
-    kappa_only = find_eye_candidates(points, CENTER, knn=KNN,
-                                     curvature_min=0.015, shape_index_max=1.01)
-    _, worst_kappa_only = match(kappa_only, truth)
-    assert worst_kappa_only > worst, 'dropping the shape index costs localisation'
+    h_only = find_eye_candidates(points, CENTER, knn=KNN, shape_index_max=1.01)
+    matched_h, worst_h = match(h_only, truth)
+    assert matched_h == 4
+    assert len(h_only) == len(both)
+    assert worst_h < 0.002
 
-    shape_only = find_eye_candidates(points, CENTER, knn=KNN,
-                                     curvature_min=0.0, shape_index_max=0.35)
+    shape_only = find_eye_candidates(points, CENTER, knn=KNN, mean_curvature_min=None)
     matched_shape, _ = match(shape_only, truth)
     assert (len(shape_only) - matched_shape) > (len(both) - matched), \
         'dropping curvature costs rejection'
+
+
+@pytest.mark.slow
+def test_the_kappa_gate_still_works_when_asked_for(potato):
+    """The gate this detector shipped with until 2026-09-16, kept behind
+    curvature_min: on the synthetic it was validated against it still
+    finds every eye, so anyone switching back gets what they had."""
+    points, _, truth = potato
+    found = find_eye_candidates(points, CENTER, knn=KNN,
+                                mean_curvature_min=None, curvature_min=0.015)
+    matched, worst = match(found, truth)
+    assert matched == 4 and len(found) == 4 and worst < 0.002
 
 
 # --- 6b. max_center_distance, the gate potato_center alone doesn't provide
@@ -277,8 +309,7 @@ def test_max_center_distance_rejects_a_lookalike_far_from_the_potato(potato, rng
     stray_points = stray_points + rng.normal(scale=SCANNER_NOISE, size=stray_points.shape)
     combined = np.vstack([points, stray_points])
 
-    ungated = find_eye_candidates(combined, CENTER, knn=KNN,
-                                  curvature_min=0.015, shape_index_max=0.35)
+    ungated = find_eye_candidates(combined, CENTER, knn=KNN)
     matched_ungated, _ = match(ungated, truth)
     assert matched_ungated == 4, 'the real eyes should still all be found'
     assert len(ungated) > 4, (
@@ -286,7 +317,6 @@ def test_max_center_distance_rejects_a_lookalike_far_from_the_potato(potato, rng
         'actually exercising the failure max_center_distance fixes')
 
     gated = find_eye_candidates(combined, CENTER, knn=KNN,
-                                curvature_min=0.015, shape_index_max=0.35,
                                 max_center_distance=0.07)
     matched_gated, worst_gated = match(gated, truth)
     assert matched_gated == 4, 'the real eyes must not be filtered out'
@@ -413,8 +443,7 @@ def test_every_candidate_reports_how_much_its_members_agree(potato):
     """The number exists so one real run can settle what a threshold should
     be. It is useless if it is not there on every candidate."""
     points, _, _ = potato
-    for candidate in find_eye_candidates(points, CENTER, knn=KNN,
-                                         curvature_min=0.015, shape_index_max=0.35):
+    for candidate in find_eye_candidates(points, CENTER, knn=KNN):
         assert 0.0 < candidate['normal_consistency'] <= 1.0
 
 
@@ -424,8 +453,7 @@ def test_agreeing_members_score_near_one(potato):
     also why this number cannot separate good normals from bad ones here --
     see the find_eye_candidates docstring."""
     points, _, _ = potato
-    found = find_eye_candidates(points, CENTER, knn=KNN,
-                                curvature_min=0.015, shape_index_max=0.35)
+    found = find_eye_candidates(points, CENTER, knn=KNN)
     assert min(c['normal_consistency'] for c in found) > 0.9
 
 
@@ -434,10 +462,8 @@ def test_the_gate_is_off_by_default_and_changes_nothing(potato):
     """min_normal_consistency=None must reproduce prior behaviour exactly,
     the same contract min_color_contrast and max_center_distance keep."""
     points, _, _ = potato
-    ungated = find_eye_candidates(points, CENTER, knn=KNN,
-                                  curvature_min=0.015, shape_index_max=0.35)
+    ungated = find_eye_candidates(points, CENTER, knn=KNN)
     explicit = find_eye_candidates(points, CENTER, knn=KNN,
-                                   curvature_min=0.015, shape_index_max=0.35,
                                    min_normal_consistency=None)
     assert len(ungated) == len(explicit)
 
@@ -446,12 +472,10 @@ def test_the_gate_is_off_by_default_and_changes_nothing(potato):
 def test_the_gate_rejects_when_it_is_actually_set(potato):
     """It has to work when a real run finally earns a threshold."""
     points, _, _ = potato
-    found = find_eye_candidates(points, CENTER, knn=KNN,
-                                curvature_min=0.015, shape_index_max=0.35)
+    found = find_eye_candidates(points, CENTER, knn=KNN)
     just_above = max(c['normal_consistency'] for c in found) + 1e-6
     assert found
     assert find_eye_candidates(points, CENTER, knn=KNN,
-                               curvature_min=0.015, shape_index_max=0.35,
                                min_normal_consistency=just_above) == []
 
 

@@ -85,11 +85,20 @@ class EyeDetector(Node):
         # drill's fixture keep-out cone is measured from too.
         self.declare_parameter('potato_center', [0.5, 0.0, 0.15])
         self.declare_parameter('knn', 30)
-        # Minimum surface variation. Dimensionless and bounded [0, 1/3], but
-        # NOT scale-invariant: with a fixed knn a denser scan gives a smaller
-        # neighbourhood, which reads flatter. Tune against a real scan using
-        # the percentiles this node logs.
-        self.declare_parameter('curvature_min', 0.015)
+        # Minimum mean curvature, in 1/m: the surface has to bend inward
+        # tighter than a sphere of radius 1/this. 150 is a 6.7mm sphere. It
+        # is the surface's physical curvature, so it does not move with scan
+        # density, and an eye (130-300/m on the simulated potato) sits
+        # 3-10x above the body's 99th percentile. Tune, if at all, against
+        # the H percentiles this node logs.
+        self.declare_parameter('mean_curvature_min', 150.0)
+        # The gate this node used until 2026-09-16: minimum surface
+        # variation kappa, dimensionless. Negative = off. It is NOT
+        # scale-invariant and it rises with the noise floor, which is why
+        # it was replaced (surface_curvature's docstring has the numbers);
+        # still computed and logged every run, since its percentiles are
+        # how a scan's density and noise get read.
+        self.declare_parameter('curvature_min', -1.0)
         # Maximum shape index. 0.35 keeps cups and ruts, rejects saddles
         # (0.5), ridges (0.75) and domes (1.0). Scale-invariant, so unlike
         # curvature_min this should not need per-setup tuning.
@@ -130,7 +139,16 @@ class EyeDetector(Node):
         self.base_frame = self.get_parameter('base_frame').value
         self.potato_center = np.array(self.get_parameter('potato_center').value, dtype=float)
         self.knn = self.get_parameter('knn').value
+        self.mean_curvature_min = self.get_parameter('mean_curvature_min').value
+        if self.mean_curvature_min < 0.0:
+            self.mean_curvature_min = None
         self.curvature_min = self.get_parameter('curvature_min').value
+        if self.curvature_min < 0.0:
+            self.curvature_min = None
+        if self.mean_curvature_min is None and self.curvature_min is None:
+            self.get_logger().warn(
+                'both mean_curvature_min and curvature_min are off: the shape index '
+                'alone is the gate, and most of what it passes is not an eye')
         self.shape_index_max = self.get_parameter('shape_index_max').value
         min_contrast = self.get_parameter('min_color_contrast').value
         self.min_color_contrast = None if min_contrast < 0.0 else min_contrast
@@ -168,25 +186,58 @@ class EyeDetector(Node):
         self.detect_and_publish(self._latest_cloud_msg)
 
     def _log_distributions(self, points):
-        """What the two scores actually look like on THIS scan.
+        """What the scores actually look like on THIS scan.
 
-        curvature_min has to be set for the scan density in use, and these
-        percentiles are how to set it: an eye occupies a small fraction of
-        the surface, so a workable threshold sits far out in kappa's upper
-        tail. Printed every run so the number can be checked against real
-        data instead of carried over from a synthetic.
+        An eye occupies a small fraction of the surface, so a workable gate
+        sits far out in the upper tail of whichever curvature it is set on;
+        these percentiles are how to see where it sits. Printed every run so
+        the numbers can be checked against real data instead of carried over
+        from a synthetic.
+
+        The thickness line is the one to compare between runs. sqrt(lambda0)
+        is how far the neighbourhood spreads along its own normal, which on
+        a smooth surface is nothing but the noise: sensor jitter, and the
+        registration residual between views that landed on the same patch.
+        kappa is made of the same lambda0, so a scan whose thickness has
+        grown is a scan whose kappa has grown everywhere -- CONFIRMED
+        off-line 2026-09-15 that the old kappa gate went from 0 spurious to
+        thousands between 0.20 and 0.25mm of it. The mean-curvature gate
+        holds through that range, but a real camera can be worse, and this
+        number says so directly rather than through a count of eyes.
         """
-        _, kappa, s_index = describe_surface(points, self.potato_center, knn=self.knn)
+        surface = describe_surface(points, self.potato_center, knn=self.knn)
         q = [50, 90, 99, 99.9]
-        kappa_q = np.percentile(kappa, q)
-        selected = (kappa > self.curvature_min) & (s_index < self.shape_index_max)
+        kappa_q = np.percentile(surface.kappa, q)
+        h_q = np.percentile(surface.mean_curvature, q)
+        cup = surface.shape_index < self.shape_index_max
+        selected = cup.copy()
+        if self.mean_curvature_min is not None:
+            selected &= surface.mean_curvature > self.mean_curvature_min
+        if self.curvature_min is not None:
+            selected &= surface.kappa > self.curvature_min
+        thickness = np.percentile(surface.thickness, [50, 90])
+
+        self.get_logger().info(
+            'mean curvature H percentiles (1/m) '
+            + ', '.join(f'p{p}={v:.0f}' for p, v in zip(q, h_q))
+            + f' | mean_curvature_min={self.mean_curvature_min}')
         self.get_logger().info(
             'kappa percentiles ' + ', '.join(f'p{p}={v:.4f}' for p, v in zip(q, kappa_q))
-            + f' | curvature_min={self.curvature_min}'
-            + f' | cup-shaped (S<{self.shape_index_max}): '
-              f'{100.0 * float((s_index < self.shape_index_max).mean()):.1f}% of points'
-            + f' | both: {int(selected.sum())} points')
-        if self.curvature_min < kappa_q[1]:
+            + f' | curvature_min={self.curvature_min}')
+        self.get_logger().info(
+            f'surface thickness (noise floor) p50={thickness[0] * 1000:.3f}mm '
+            f'p90={thickness[1] * 1000:.3f}mm'
+            + f' | cup-shaped (S<{self.shape_index_max}): {100.0 * float(cup.mean()):.1f}% of points'
+            + f' | gated: {int(selected.sum())} points')
+
+        if self.mean_curvature_min is not None and self.mean_curvature_min < h_q[1]:
+            self.get_logger().warn(
+                f'mean_curvature_min={self.mean_curvature_min} sits below this scan\'s 90th '
+                f'percentile of H ({h_q[1]:.0f}/m) -- that admits a large fraction of the '
+                f'surface as "a pit", which means either the potato is far from a 35mm '
+                f'body or the cloud is noisy enough that the fitted curvature is noise '
+                f'(see the thickness line)')
+        if self.curvature_min is not None and self.curvature_min < kappa_q[1]:
             self.get_logger().warn(
                 f'curvature_min={self.curvature_min} sits below this scan\'s 90th '
                 f'percentile ({kappa_q[1]:.4f}) -- that admits a large fraction of the '
@@ -215,6 +266,7 @@ class EyeDetector(Node):
 
         candidates = find_eye_candidates(
             pts, self.potato_center, knn=self.knn,
+            mean_curvature_min=self.mean_curvature_min,
             curvature_min=self.curvature_min,
             shape_index_max=self.shape_index_max,
             cluster_eps=self.cluster_eps,
@@ -230,8 +282,8 @@ class EyeDetector(Node):
         for i, c in enumerate(candidates):
             self.get_logger().info(
                 f"  #{i} at {np.round(c['position'], 4)} diameter "
-                f"{c['diameter'] * 1000:.1f}mm shape_index {c['shape_index']:.3f} "
-                f"({c['points']} points) "
+                f"{c['diameter'] * 1000:.1f}mm H {c['mean_curvature']:.0f}/m "
+                f"shape_index {c['shape_index']:.3f} ({c['points']} points) "
                 f"normal_consistency {c['normal_consistency']:.4f}"
                 + ('' if colors is None else
                    f" colour_contrast {c['color_contrast']:+.3f} "
@@ -241,8 +293,8 @@ class EyeDetector(Node):
         if eyes and not (low <= len(eyes) <= high):
             self.get_logger().warn(
                 f'{len(eyes)} eyes is outside the {low}-{high} a potato plausibly has. '
-                f'Check curvature_min against the percentiles above before drilling '
-                f'these.')
+                f'Check mean_curvature_min against the H percentiles and the thickness '
+                f'line above before drilling these.')
 
         self._publish_markers(eyes)
         self._publish_poses(eyes)

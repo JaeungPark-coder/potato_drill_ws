@@ -53,7 +53,7 @@ separates "my install is wrong" from "my hardware is wrong":
 ```bash
 cd src/potato_scan
 
-# 166 checks over the geometry, planning and detection maths. ~45 s.
+# 169 checks over the geometry, planning and detection maths. ~30 s.
 python -m pytest test/ -q
 
 # the fast subset, if you just want to know the install is sound. ~4 s.
@@ -138,6 +138,21 @@ which change how the next live run's report should be read:
    per-potato depth/width jitter and the noise level. 3/7 is what this
    setting does on full coverage too.
 
+**2026-09-16: the gate changed because of (2) and (3).** `eye_detector`
+now gates on mean curvature `H` in 1/m (`mean_curvature_min: 150.0`,
+"bends tighter than a 6.7mm sphere") instead of kappa. It is the
+surface's physical curvature from the quadratic fit the shape index was
+already using, so it does not move with point density, and on the
+simulated potato it separates eyes (130-300/m) from the body (99th
+percentile 18-68/m) by 3-10x. On the same 30 potatoes: 57% found / 0
+spurious at 0.15mm noise (kappa: 32% / 0), and 75% / 0 at 0.25mm where
+kappa collapsed to 35% / 2232. The kappa gate is still there behind
+`curvature_min` (off by default) and still logged, and the log gained a
+`surface thickness` line -- sqrt(lambda0), i.e. the noise floor in mm --
+which is the number to compare between the 43% and 67% runs. The next
+live run is the first with this gate; its report is not comparable to
+the numbers above, and reading it is now step 1's job.
+
 ### 0. Confirm the scene still starts
 
 `isaac_scene.py` imports `potato_scan.drill_task_planner` for the one
@@ -208,7 +223,7 @@ fixes, and telling them apart by hand took its own investigation on
 |---|---|---|
 | ok | ok | detection is sound; anything left is the arm or the fixture |
 | ok | OVER WARN | the 84-degree case. The eye is found, the approach direction is not. Look at `normal_consistency` in the `eye_detector` log for the same eye |
-| OVER TARGET | either | the cluster centre is off. `curvature_min` / `shape_index_max` (step 4 below) |
+| OVER TARGET | either | the cluster centre is off. `mean_curvature_min` / `shape_index_max` (step 4 below) |
 | missed / spurious | — | a threshold problem, not a precision one. Same two parameters |
 
 ### 2. Pair the normal errors with the confidence number
@@ -389,11 +404,16 @@ ros2 launch potato_scan potato_drill.launch.py
 
 Watch two things in the log:
 
-- **`curvature_min` against the logged κ percentiles.** κ is dimensionless but
-  *not* scale-invariant: a denser scan gives a smaller neighbourhood, which
-  reads flatter. The shipped 0.015 is validated on a synthetic at ~0.9 mm
-  spacing. `eye_detector` prints the percentiles every run and warns when the
-  threshold sits below the 90th.
+- **`mean_curvature_min` against the logged H percentiles, and the
+  `surface thickness` line.** H is the surface's curvature in 1/m, so the
+  shipped 150 ("tighter than a 6.7 mm sphere") means the same thing at any
+  scan density; what can still defeat it is noise, and the thickness line
+  is that noise in mm, read straight off the cloud. On the simulated potato
+  the gate holds 0 spurious to 0.25 mm and starts admitting noise at 0.30.
+  `eye_detector` prints all of it every run and warns when the threshold
+  sits below H's 90th percentile. (κ, the gate until 2026-09-16, is still
+  logged; it is not scale-invariant and rises with the noise floor, which
+  is why it was replaced.)
 - **`colour_contrast` per candidate.** Curvature and shape index describe a
   pit, and a clod of soil in a hollow is also a pit — colour is the only axis
   that separates them. It is measured and reported but not enforced
@@ -477,7 +497,7 @@ step produce plausible nonsense.
 | 1 | Camera minimum range | the model number | `camera range:` line at scan startup is `info`, not `error` |
 | 2 | Hand-eye calibration | board + robot | reprojection residual printed by the tool; then step 4's number |
 | 3 | Scan geometry | robot + camera | coverage reaches threshold without a pile of `unreachable` warnings |
-| 4 | Detection thresholds | real scans | eye count lands in 2–15, κ threshold above the 90th percentile |
+| 4 | Detection thresholds | real scans | eye count lands in 2–15, `mean_curvature_min` above H's 90th percentile, thickness line under ~0.25 mm |
 | 5 | **Position accuracy** | robot + callipers | `calliper_check` mean under ~2 mm |
 | 6 | Force limits | robot + potatoes | `force_drill_tuner` reaches depth without tripping `max_force` |
 | 7 | Depth collar | 3D printer | insertion stops on `max_force` when the collar meets skin |
@@ -521,7 +541,8 @@ Messages below are quoted as the nodes actually print them.
 
 | you see | it means | do |
 |---|---|---|
-| `curvature_min=... sits below this scan's 90th percentile` | the threshold is set for a different point density | raise it toward the p99 the same line prints |
+| `mean_curvature_min=... sits below this scan's 90th percentile of H` | the cloud is noisy enough that fitted curvature is noise, or the potato is far from a 35 mm body | read the `surface thickness` line: above ~0.25 mm, fix the scan (outlier filter, registration) before the threshold |
+| `curvature_min=... sits below this scan's 90th percentile` | only if you turned the old κ gate back on: set for a different point density | raise it toward the p99 the same line prints, or leave it off |
 | `N eyes is outside the 2-15 a potato plausibly has` | thresholds wrong for this scan, not an unusual potato | check the percentile line above it first |
 | `merged cloud has no colour` | the accumulator got a depth-only topic | see the `rgb` row above |
 | plausible eye count, wrong places | soil clods read as pits — geometry cannot separate them | look at the logged `colour_contrast`; if eyes and clods separate, set `min_color_contrast` between them |
@@ -771,7 +792,9 @@ on effects this model omits, not on geometry.
   40-view raster plus up to 20 gap-fill views, and then up to 24 approach
   candidates per eye in drilling, add up fast -- budget accordingly rather
   than assuming a long-running scan or drill attempt is stuck.
-- **`curvature_min` is tuned on a synthetic**, not a real potato.
+- **`mean_curvature_min` is tuned on a synthetic**, not a real potato -- but
+  in the surface's own units (1/m), so a real eye's number can be read off
+  one real scan's H log and compared directly.
 - **The bottom of the potato is not scanned.** The elevation band starts at
   −15°, so eyes near the pin are never found. Deliberate — that end carries
   few eyes, and it is where the fixture is — but it is a real blind spot, and
@@ -901,7 +924,30 @@ on effects this model omits, not on geometry.
   already warns about, now with the number attached: on this cloud the
   detector is operating within a factor of ~1.5 of its own threshold on
   both sides, which is why a modest change in noise flips it from missing
-  most eyes to accepting everything. Not changed here -- which gate
-  replaces it is a detector design decision, and the noise level of a
-  real camera is the input it needs -- but `--curvature-min` on
-  `sim_detection_check` sweeps it in seconds, which is where to start.
+  most eyes to accepting everything.
+
+  **Replaced 2026-09-16.** `principal_curvatures` already fitted a
+  quadratic patch per point for the shape index; its mean curvature
+  `H = (k1 + k2) / 2`, in 1/m, is the physical curvature and reads
+  130-300/m at an eye against a body 99th percentile of 18-68/m -- with
+  outward normals the convex body is negative, so the gate is one-sided.
+  Swapping only the curvature axis, same clustering and size window
+  (`sim_detection_check`'s docstring has the full table):
+
+  | noise | kappa > 0.015 | H > 150/m |
+  |---|---|---|
+  | 0.00 mm | 11% found, 0 spurious | 42%, 0 |
+  | 0.15 mm | 32%, 0 | 57%, 0 |
+  | 0.20 mm | 59%, 17 | 66%, 0 |
+  | 0.25 mm | 35%, 2232 | 75%, 0 |
+  | 0.30 mm | 1%, 405 | 85%, 15 |
+
+  Position error stayed 0.7-1.1 mm mean under H throughout, where kappa's
+  grew to 3-7 mm. 100/m finds more (93% at 0.15 mm) but admits noise from
+  0.20 mm; 200/m is clean everywhere and misses half the shallow eyes; 150
+  is the default. `curvature_min` remains as an off-by-default second
+  gate, `eye_detector` logs both sets of percentiles plus the surface
+  thickness (sqrt(lambda0) -- the noise floor in mm, which is what the
+  43%-vs-67% comparison actually needs), and on the synthetic test potato
+  the shape index turned out to add nothing once H is signed -- kept as
+  the saddle guard, at no cost. Not yet run live.
