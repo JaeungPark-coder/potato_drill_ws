@@ -731,3 +731,50 @@ on effects this model omits, not on geometry.
   The visible band is a weak tuber-versus-soil discriminator on its own: good
   on wet material, doubtful when dry. A near-infrared band is the established
   answer if soil turns out to be a real problem.
+- **`isaac_scene.py`'s procedural potato was carving eyes ~39mm across --
+  found, root-caused and fixed 2026-09-15, running the "next Isaac Sim
+  session" bring-up steps above against a live scene for the first time.**
+  A real scan (10 raster views, 82% coverage, 8.9M merged points) came back
+  with `eye_detector detected 0 potato eyes` -- and re-running with 3x more
+  points changed nothing, which ruled out "not enough scan" before any
+  threshold was touched. Pulling the merged cloud and `isaac_scene`'s own
+  ground truth out via a throwaway subscriber and checking kappa AT each of
+  the 7 real eye positions directly (not at whatever `find_eye_candidates`
+  happened to cluster) showed why: kappa there topped out at 0.0001-0.0088,
+  2-150x below `curvature_min=0.015`, unmoved by the extra points. Reading
+  `make_potato_mesh`'s own eye formula found the actual cause: `dot > 0.85`
+  is a 31.8-degree cone, which at `base_radius=35mm` carves a **~39mm-diameter**
+  pit -- an order of magnitude past the 2-15mm `min/max_eye_diameter` the
+  rest of the pipeline (this file's own force_drill_tuner section, the
+  depth-collar sizing for a 3.25mm bit) is built around. Curvature over a
+  30-point neighbourhood reads nearly flat on a bowl that wide; the two
+  candidates that DID clear the filters each run (diameter 4.6-10mm, distance
+  50mm+ from every real eye) were something else on the surface entirely,
+  which is exactly what `detection_accuracy_check` reported them as:
+  `spurious`, not a near-miss.
+
+  Fixed by replacing the `dot > 0.85` linear-ramp cap with the SAME Gaussian
+  dimple profile (`EYE_DEPTH_M=0.0035`, `EYE_SIGMA_RAD=0.09`, jittered
+  ±15-30% per potato) this project's own `test_surface_curvature.py` already
+  validates detection against at this exact `base_radius` -- reusing proven
+  numbers rather than guessing new ones. That alone would carve a
+  correctly-sized pit invisible to the mesh, though: with
+  `SetSubdivisionSchemeAttr("none")`, every face renders perfectly flat, so
+  curvature only ever appears at a vertex, and the original 24x36 grid
+  (864 vertices, ~5mm spacing) can leave a 2-15mm pit with zero vertices
+  inside it. `n_lat`/`n_lon` defaults raised to 60x90 (5400 vertices, ~2mm
+  spacing) so a realistically-sized eye still spans several.
+
+  **Confirmed on a fresh scene with 3 fewer raster views than the failing
+  run (3 views, 43-49% coverage vs. the prior 10 views/82%):** 2/7 eyes
+  found, 0 spurious, position error 1.05/3.19mm, normal error 1.9/12.9deg
+  (both -- worst case included -- comfortably inside the 2mm/45deg bars
+  bring-up step 1 checks against). Re-running detection again at 61%
+  coverage found the same 2 and no more, which reads as "the other 5 eyes'
+  neighbourhood isn't scanned yet" rather than a detection failure -- the two
+  that ARE covered are found accurately and every run, zero false positives.
+  Whether the remaining 5 come in with fuller coverage, and whether the
+  now-working detector changes anything at bring-up steps 2-3 (pairing
+  `normal_consistency` against `normal_vs_radial_deg`, then drilling), is
+  what running the rest of "The next Isaac Sim session" order will show --
+  not yet done as of this note.

@@ -31,8 +31,23 @@ ROBOT_PRIM_PATH = "/World/ur5e"
 TOOL_LINK_PRIM_PATH = "/World/ur5e/wrist_3_link/flange"
 
 
+# The eye pits below deliberately reuse the exact depth/width this project's
+# own synthetic test suite already validates detection against
+# (test_surface_curvature.py's EYE_DEPTH/EYE_SIGMA, at the same 35mm
+# base_radius) rather than inventing new numbers -- see the 2026-09-15 field
+# note in the README: the original `dot > 0.85` cap produced a ~39mm-diameter
+# pit (a 31.8-degree cone at this radius), an order of magnitude wider than
+# the 2-15mm min/max_eye_diameter the rest of the pipeline (eye_detector,
+# force_drill_tuner, the depth-collar sizing for a 3.25mm bit) is built
+# around -- curvature over a `knn`-point neighbourhood reads nearly flat on a
+# bowl that wide, which is why every one of 7 ground-truth eyes measured
+# kappa 2-50x below curvature_min even at 82% scan coverage.
+EYE_DEPTH_M = 0.0035
+EYE_SIGMA_RAD = 0.09
+
+
 def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35,
-                      n_lat=24, n_lon=36, seed=None):
+                      n_lat=60, n_lon=90, seed=None):
     """Procedural bumpy-blob mesh standing in for a real potato: a
     perturbed sphere with a handful of random low-frequency bumps
     (irregular overall shape -- exercises the shape-agnostic coverage
@@ -40,6 +55,15 @@ def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35
     eye_detector's concavity clustering, and give the drill-approach RL
     env ground-truth targets without needing to run eye_detector during
     training). Re-seed for a different "potato" each run/episode.
+
+    `n_lat`/`n_lon` default to 60x90 (5400 vertices, ~2mm spacing), not the
+    original 24x36 (864 vertices, ~5mm spacing): with `SetSubdivisionSchemeAttr
+    ("none")` below, every face renders perfectly flat, so curvature only
+    ever appears at a vertex where two faces meet -- a pit narrower than the
+    vertex spacing has no vertex inside it to carve, and does not exist in
+    the rendered geometry at all regardless of the depth formula. At ~2mm
+    spacing a realistically-sized eye (see EYE_SIGMA_RAD below) still spans
+    several vertices.
 
     Returns (mesh, eye_points, eye_normals): eye_points/eye_normals are
     world-space (N, 3) arrays -- the approximate position (pit center,
@@ -60,7 +84,11 @@ def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35
     n_eyes = int(rng.integers(3, 8))
     eye_dirs = rng.normal(size=(n_eyes, 3))
     eye_dirs /= np.linalg.norm(eye_dirs, axis=1, keepdims=True)
-    eye_depth = rng.uniform(0.15, 0.3) * base_radius
+    # Per-potato jitter around the validated values, not per-eye: keeps every
+    # eye on one potato mutually consistent while still varying instance to
+    # instance across re-seeds, same pattern the old eye_depth draw used.
+    eye_depth = rng.uniform(0.7, 1.3) * EYE_DEPTH_M
+    eye_sigma = rng.uniform(0.85, 1.15) * EYE_SIGMA_RAD
 
     points = []
     for lat in lats:
@@ -70,9 +98,8 @@ def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35
             for bd, amp, w in zip(bump_dirs, bump_amp, bump_width):
                 r += amp * max(0.0, float(np.dot(d, bd))) ** (1.0 / w)
             for ed in eye_dirs:
-                dot = float(np.dot(d, ed))
-                if dot > 0.85:
-                    r -= eye_depth * (dot - 0.85) / 0.15
+                angle = np.arccos(np.clip(float(np.dot(d, ed)), -1.0, 1.0))
+                r -= eye_depth * np.exp(-(angle ** 2) / (2.0 * eye_sigma ** 2))
             points.append(center + d * r)
     points = np.array(points)
 
