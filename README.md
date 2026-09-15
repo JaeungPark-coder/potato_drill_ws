@@ -97,9 +97,18 @@ suite `colcon test` runs.
 
 ## The next Isaac Sim session, in order
 
-Everything below runs in the simulator. None of it needs a robot, a camera or
-a potato. Do them in this order: step 0 costs 30 seconds and every later step
-is built on it.
+**2026-09-15 update: step 0 and a first pass at step 1 are done.** The
+eye-pit size fix (see "Known gaps" below) took detection from 0/7 real eyes
+found -- at 82% scan coverage, with the geometry actually wrong -- to 2/7
+found with 0 spurious at just 43-49% coverage, and 3/7 at 67% (position
+error 1.85mm mean/2.94mm worst, normal error 4.3/9.4deg -- both inside the
+bars this file's own bring-up table checks against). The scan that produced
+that 3/7 number was killed (exit code -9, most likely a resource squeeze
+from three Isaac Sim instances running at once across two projects, not a
+bug in this one) at 69-72% coverage during gap-filling, before reaching the
+95% `coverage_threshold` or exhausting the 20-view gap-fill budget -- so
+whether the remaining 4 eyes are a coverage problem or something else is
+still open. Steps 2 and 3 below have not been run at all yet.
 
 ### 0. Confirm the scene still starts
 
@@ -123,9 +132,7 @@ published N ground-truth eyes on /potato_scan/ground_truth_eyes
 | the scene starts but no `published N ground-truth eyes` line | the scene predates the ground-truth wiring, or `make_potato_mesh` carved no pits |
 | both lines, then the usual idle | good. Leave it running and go to step 1 |
 
-### 1. Get a real number for detection accuracy
-
-In a second terminal (this one **does** want the workspace sourced):
+### 1. Get a real number for detection accuracy -- and this time let it finish
 
 ```bash
 source install/setup.bash
@@ -138,9 +145,14 @@ Use `potato_drill.launch.py`, not `scan.launch.py` — only the former starts
 assuming a missing trigger is a bug.
 
 A full 40+20-view raster takes tens of minutes now that views actually
-settle. To get an answer sooner, publish `scan_complete` partway through and
-score the partial cloud; the numbers are then about a partial scan, which is
-worth writing down next to them.
+settle -- confirmed 2026-09-15 to run past an hour before gap-filling either
+finishes or exhausts its budget. **Run only this one Isaac Sim instance at a
+time** (the 2026-09-15 kill happened with three running at once, two of
+them in the sibling `vla_ur5e_ws` project); if you want an answer sooner
+than a full run, publish `scan_complete` partway through as before, but a
+full run is now the thing actually worth doing at least once, to see
+whether the remaining eyes come in with real coverage or the geometry fix
+above has its own ceiling.
 
 ```bash
 ros2 topic pub --once /potato_scan/scan_complete std_msgs/msg/Bool "{data: true}"
@@ -171,7 +183,9 @@ fixes, and telling them apart by hand took its own investigation on
 index. One run gives enough pairs to decide whether
 `min_normal_consistency` (shipped off, in `config/params.yaml`) is worth
 setting and to what — which cannot honestly be decided from synthetic data,
-where the number does not predict the error at all.
+where the number does not predict the error at all. Not yet run: every
+2026-09-15 run stopped at scan/detect, before `start_drilling` was ever
+published, so there is no `normal_vs_radial_deg` to pair against yet.
 
 ### 3. Only then, the drill
 
