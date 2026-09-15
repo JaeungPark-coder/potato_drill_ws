@@ -53,14 +53,19 @@ separates "my install is wrong" from "my hardware is wrong":
 ```bash
 cd src/potato_scan
 
-# 151 checks over the geometry, planning and detection maths. ~30 s.
+# 166 checks over the geometry, planning and detection maths. ~45 s.
 python -m pytest test/ -q
 
-# the fast subset, if you just want to know the install is sound. ~2 s.
+# the fast subset, if you just want to know the install is sound. ~4 s.
 python -m pytest test/ -q -m "not slow"
 
 # the view-budget sweep: runs the real coverage grid against simulated potatoes
 python -m potato_scan.scan_budget --potatoes 5
+
+# the eye detector against the Isaac Sim potato -- the same geometry
+# isaac_scene.py builds, sampled at the accumulator's voxel size -- with no
+# Isaac Sim. --seed N rebuilds the exact potato a scene run printed at startup.
+python -m potato_scan.sim_detection_check --seeds 30
 
 # is the camera even usable at the configured distance?
 python -c "
@@ -106,9 +111,32 @@ bars this file's own bring-up table checks against). The scan that produced
 that 3/7 number was killed (exit code -9, most likely a resource squeeze
 from three Isaac Sim instances running at once across two projects, not a
 bug in this one) at 69-72% coverage during gap-filling, before reaching the
-95% `coverage_threshold` or exhausting the 20-view gap-fill budget -- so
-whether the remaining 4 eyes are a coverage problem or something else is
-still open. Steps 2 and 3 below have not been run at all yet.
+95% `coverage_threshold` or exhausting the 20-view gap-fill budget.
+Steps 2 and 3 below have not been run at all yet.
+
+**2026-09-15, later, off-line:** whether the remaining 4 eyes were a
+coverage problem is no longer open -- see "Known gaps" (the
+`sim_detection_check` entry) for the measurements. Three things came out
+of running the detector against the simulated potato on a laptop, all of
+which change how the next live run's report should be read:
+
+1. **The published ground truth was inside the potato.** Eye positions
+   ignored the mesh's bumps (up to 12mm of radius), so the truth sat a
+   median 6mm under the surface and beyond the 8mm matching tolerance for
+   37% of eyes -- each of those scored as one miss plus one spurious
+   detection regardless of what the detector did. Fixed; part of the "4
+   missed, 8 spurious" was very likely this, and the next run's numbers
+   are not comparable to the ones above.
+2. **The bumps do not make spurious eyes; the noise floor does.** The
+   `bump_dirs` hypothesis below was checked over 30 potatoes and refuted.
+   What produces spurious detections is kappa's 90th percentile rising
+   toward `curvature_min` -- `eye_detector` logs it every run. Read it at
+   43% and at 67% before touching any threshold.
+3. **Recall at this threshold is ~30%, by design of the threshold, not
+   the scan.** A nominal pit measures kappa 0.010-0.016 on a 1mm cloud,
+   straddling `curvature_min=0.015`; which eyes clear it is decided by the
+   per-potato depth/width jitter and the noise level. 3/7 is what this
+   setting does on full coverage too.
 
 ### 0. Confirm the scene still starts
 
@@ -123,12 +151,19 @@ Launch the scene exactly as in the next section. You are looking for two
 lines, in this order:
 
 ```
+potato seed 1234567: 7 eyes (depth 3.50mm, sigma 5.2deg), 5 bumps
 published N ground-truth eyes on /potato_scan/ground_truth_eyes
 ```
+
+Write the seed down. `python -m potato_scan.sim_detection_check --seed
+1234567` rebuilds that exact potato with no Isaac Sim and tags every
+candidate against its true eyes and its bumps, which is how a detection the
+live report cannot explain gets explained.
 
 | what you see | what it means |
 |---|---|
 | `ModuleNotFoundError: No module named 'potato_scan'` | the path insert is wrong for your layout. Nothing downstream can work; fix this first |
+| no `potato seed` line | the scene predates the seed logging; the potato it built cannot be reproduced off-line, so a spurious detection on it cannot be checked. Pull first |
 | the scene starts but no `published N ground-truth eyes` line | the scene predates the ground-truth wiring, or `make_potato_mesh` carved no pits |
 | both lines, then the usual idle | good. Leave it running and go to step 1 |
 
@@ -815,3 +850,58 @@ on effects this model omits, not on geometry.
   enough that adjacent ones can't create a sub-15mm concave valley) rather
   than the eye side touched here. Worth confirming with `bump_dirs` logged
   before spending time tuning `curvature_min`/`shape_index_max` against it.
+
+  **Checked off-line, same day, and it does not hold.** The potato's
+  geometry now exists outside Kit (`potato_scan/procedural_potato.py`: the
+  identical random draws in the identical order, so a seed reproduces the
+  potato Isaac built, plus a sampler that stands in for the depth camera
+  at the accumulator's 1mm voxel), which made the hypothesis testable
+  with the real `find_eye_candidates` and the real scoring, over as many
+  potatoes as wanted (`python -m potato_scan.sim_detection_check`). With
+  the eye pits carved AND with them removed, noise off, 30 potatoes
+  produced **0 spurious candidates**: the bumps on their own make nothing
+  the detector accepts. What does is the noise floor. kappa is a
+  covariance ratio, so isotropic noise raises it everywhere: at 0.15mm
+  its 90th percentile is ~0.007 and spurious stays 0; at 0.20mm, ~0.012
+  and 18 appear across 30 eyeless potatoes; at 0.25mm, ~0.018 -- past
+  `curvature_min` -- and every point on the potato is a candidate (2232
+  spurious). A merged cloud that thickens as more views land on the same
+  surface (TF residual, per-view registration) is indistinguishable from
+  rising noise to this detector, which fits 0 spurious at 43-49% coverage
+  and 8 at 67% without any valley. `eye_detector` already logs the kappa
+  percentiles per run: the 67% run's p90 against the 43% run's is the
+  number that decides it.
+
+  Two more things fell out of the same tool. **The ground truth
+  `isaac_scene.py` publishes was inside the potato:** `make_potato_mesh`
+  placed each eye at `base_radius - eye_depth` along its direction,
+  "ignoring the smaller bump contribution", and it was not small -- bumps
+  add up to `bumpiness * base_radius` = 12mm of radius, so over 200 seeds
+  the truth sat a median 6.2mm under the surface and beyond the 8mm
+  matching tolerance for 37% of eyes. Each of those scored as one missed
+  eye plus one spurious detection however well the detector did, and
+  scoring the same detections against the corrected truth moved the
+  position error from ~4.0mm mean/7.9mm worst to ~0.9/1.5mm. Fixed: the
+  truth is now where the pit meets the actual surface, and `isaac_scene`
+  builds its mesh from the same geometry object it publishes truth from,
+  so the two cannot drift again. The normal stays the pit's axis, by
+  measurement: the detector's normal tracks it at 6.0deg mean / 11.7deg
+  worst on noiseless clouds versus 9.2 / 29.2 for the surface normal of
+  the flank the pit sits on.
+
+  And **recall is set by `curvature_min`, not by coverage.** A nominal pit
+  (3.5mm deep, sigma 0.09rad) on a noiseless 1mm cloud measures kappa
+  0.010-0.016 at its most curved -- straddling 0.015 -- so which eyes
+  clear it comes down to the per-potato depth/sigma jitter (recall ran 6%
+  for the shallowest-widest potatoes to 100% for the sharpest) and to the
+  noise (13% with none, 32% at 0.15mm, 55% at 0.20mm, then the cliff
+  above). 3/7 found at 67% coverage is what this threshold does at full
+  coverage too; the remaining eyes were not unscanned, they were under
+  the bar. This is the density dependence `surface_curvature`'s docstring
+  already warns about, now with the number attached: on this cloud the
+  detector is operating within a factor of ~1.5 of its own threshold on
+  both sides, which is why a modest change in noise flips it from missing
+  most eyes to accepting everything. Not changed here -- which gate
+  replaces it is a detector design decision, and the noise level of a
+  real camera is the input it needs -- but `--curvature-min` on
+  `sim_detection_check` sweeps it in seconds, which is where to start.

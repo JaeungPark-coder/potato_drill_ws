@@ -14,6 +14,9 @@ Only import this from a script already running inside Isaac Sim's own Kit
 runtime (i.e. after `from isaacsim import SimulationApp; SimulationApp(...)`
 has run) -- omni/pxr/isaacsim.* aren't importable otherwise.
 """
+import os
+import sys
+
 import numpy as np
 import carb
 from pxr import UsdGeom, UsdPhysics, Gf
@@ -31,23 +34,20 @@ ROBOT_PRIM_PATH = "/World/ur5e"
 TOOL_LINK_PRIM_PATH = "/World/ur5e/wrist_3_link/flange"
 
 
-# The eye pits below deliberately reuse the exact depth/width this project's
-# own synthetic test suite already validates detection against
-# (test_surface_curvature.py's EYE_DEPTH/EYE_SIGMA, at the same 35mm
-# base_radius) rather than inventing new numbers -- see the 2026-09-15 field
-# note in the README: the original `dot > 0.85` cap produced a ~39mm-diameter
-# pit (a 31.8-degree cone at this radius), an order of magnitude wider than
-# the 2-15mm min/max_eye_diameter the rest of the pipeline (eye_detector,
-# force_drill_tuner, the depth-collar sizing for a 3.25mm bit) is built
-# around -- curvature over a `knn`-point neighbourhood reads nearly flat on a
-# bowl that wide, which is why every one of 7 ground-truth eyes measured
-# kappa 2-50x below curvature_min even at 82% scan coverage.
-EYE_DEPTH_M = 0.0035
-EYE_SIGMA_RAD = 0.09
+# The potato's geometry -- vertex grid, eye pits, bumps, and the seed that
+# reproduces them -- lives in potato_scan.procedural_potato, as plain numpy,
+# so the same potato Kit builds here can be generated and analysed on a
+# machine with no Isaac Sim at all (see sim_detection_check). This module
+# only wraps it in a USD mesh. The path insert is the same one isaac_scene.py
+# and the RL envs already carry, repeated here so that this file resolves
+# potato_scan even if imported first, and it is a no-op when they did.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from potato_scan.procedural_potato import (  # noqa: E402
+    EYE_DEPTH_M, EYE_SIGMA_RAD, generate as generate_potato_geometry)
 
 
 def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35,
-                      n_lat=60, n_lon=90, seed=None):
+                      n_lat=60, n_lon=90, seed=None, geometry=None):
     """Procedural bumpy-blob mesh standing in for a real potato: a
     perturbed sphere with a handful of random low-frequency bumps
     (irregular overall shape -- exercises the shape-agnostic coverage
@@ -56,65 +56,28 @@ def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35
     env ground-truth targets without needing to run eye_detector during
     training). Re-seed for a different "potato" each run/episode.
 
-    `n_lat`/`n_lon` default to 60x90 (5400 vertices, ~2mm spacing), not the
-    original 24x36 (864 vertices, ~5mm spacing): with `SetSubdivisionSchemeAttr
-    ("none")` below, every face renders perfectly flat, so curvature only
-    ever appears at a vertex where two faces meet -- a pit narrower than the
-    vertex spacing has no vertex inside it to carve, and does not exist in
-    the rendered geometry at all regardless of the depth formula. At ~2mm
-    spacing a realistically-sized eye (see EYE_SIGMA_RAD below) still spans
-    several vertices.
+    The geometry itself (what the bumps and pits are, why 60x90 vertices,
+    the eye depth/width reused from the test suite) is defined once in
+    potato_scan.procedural_potato.generate -- this only turns its output
+    into a USD mesh. Pass `geometry` (a PotatoGeometry) to build from one
+    already generated, which is how isaac_scene.py logs the seed and the
+    bumps of the potato it is about to publish ground truth for; otherwise
+    one is generated here from the remaining arguments.
 
     Returns (mesh, eye_points, eye_normals): eye_points/eye_normals are
-    world-space (N, 3) arrays -- the approximate position (pit center,
-    ignoring the smaller bump-driven radius perturbation there) and
-    outward normal (+Z-is-outward convention, matching
-    eye_detector.normal_to_quat) of each procedurally-placed eye pit.
+    world-space (N, 3) arrays -- the position where each procedurally-placed
+    eye pit meets the actual surface (bumps included) and the pit's outward
+    axis (+Z-is-outward convention, matching eye_detector.normal_to_quat).
     """
-    rng = np.random.default_rng(seed)
-    lats = np.linspace(-np.pi / 2, np.pi / 2, n_lat)
-    lons = np.linspace(0, 2 * np.pi, n_lon, endpoint=False)
-
-    n_bumps = int(rng.integers(4, 7))
-    bump_dirs = rng.normal(size=(n_bumps, 3))
-    bump_dirs /= np.linalg.norm(bump_dirs, axis=1, keepdims=True)
-    bump_amp = rng.uniform(0.1, 1.0, size=n_bumps) * bumpiness * base_radius
-    bump_width = rng.uniform(0.4, 1.0, size=n_bumps)
-
-    n_eyes = int(rng.integers(3, 8))
-    eye_dirs = rng.normal(size=(n_eyes, 3))
-    eye_dirs /= np.linalg.norm(eye_dirs, axis=1, keepdims=True)
-    # Per-potato jitter around the validated values, not per-eye: keeps every
-    # eye on one potato mutually consistent while still varying instance to
-    # instance across re-seeds, same pattern the old eye_depth draw used.
-    eye_depth = rng.uniform(0.7, 1.3) * EYE_DEPTH_M
-    eye_sigma = rng.uniform(0.85, 1.15) * EYE_SIGMA_RAD
-
-    points = []
-    for lat in lats:
-        for lon in lons:
-            d = np.array([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
-            r = base_radius
-            for bd, amp, w in zip(bump_dirs, bump_amp, bump_width):
-                r += amp * max(0.0, float(np.dot(d, bd))) ** (1.0 / w)
-            for ed in eye_dirs:
-                angle = np.arccos(np.clip(float(np.dot(d, ed)), -1.0, 1.0))
-                r -= eye_depth * np.exp(-(angle ** 2) / (2.0 * eye_sigma ** 2))
-            points.append(center + d * r)
-    points = np.array(points)
-
-    faces = []
-    for i in range(n_lat - 1):
-        for j in range(n_lon):
-            j2 = (j + 1) % n_lon
-            a, b = i * n_lon + j, i * n_lon + j2
-            c, dd = (i + 1) * n_lon + j2, (i + 1) * n_lon + j
-            faces.append((a, b, c, dd))
+    if geometry is None:
+        geometry = generate_potato_geometry(
+            center, base_radius=base_radius, bumpiness=bumpiness,
+            n_lat=n_lat, n_lon=n_lon, seed=seed)
 
     mesh = UsdGeom.Mesh.Define(stage, prim_path)
-    mesh.CreatePointsAttr([Gf.Vec3f(*p) for p in points])
-    mesh.CreateFaceVertexCountsAttr([4] * len(faces))
-    mesh.CreateFaceVertexIndicesAttr([idx for f in faces for idx in f])
+    mesh.CreatePointsAttr([Gf.Vec3f(*p) for p in geometry.points])
+    mesh.CreateFaceVertexCountsAttr([4] * len(geometry.faces))
+    mesh.CreateFaceVertexIndicesAttr([int(idx) for f in geometry.faces for idx in f])
     mesh.CreateSubdivisionSchemeAttr("none")
 
     prim = mesh.GetPrim()
@@ -130,14 +93,7 @@ def make_potato_mesh(stage, prim_path, center, base_radius=0.035, bumpiness=0.35
     mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
     mesh_collision_api.CreateApproximationAttr("none")
 
-    # Approximate pit-bottom position: base_radius minus the full eye_depth
-    # (reached exactly along eye_dir, where dot == 1 in the loop above),
-    # ignoring the smaller bump contribution at that direction -- close
-    # enough for RL training targets, not a precise geometry query.
-    eye_points = center + eye_dirs * (base_radius - eye_depth)
-    eye_normals = eye_dirs.copy()
-
-    return mesh, eye_points, eye_normals
+    return mesh, geometry.eye_points, geometry.eye_normals
 
 
 def add_drill_tip(stage, parent_path, prim_path="drill_tip", length=0.02, radius=0.0015,

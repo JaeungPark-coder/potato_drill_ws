@@ -102,6 +102,7 @@ from potato_scan.drill_task_planner import normal_rotation  # noqa: E402
 from isaac_sim_common import (
     UR5E_ASSET_RELATIVE_PATH, ROBOT_PRIM_PATH, TOOL_LINK_PRIM_PATH,
     make_potato_mesh, add_drill_tip, ContactForceReader, setup_rmpflow, prim_world_pose,
+    generate_potato_geometry,
 )
 
 # ---------------------------------------------------------------------------
@@ -111,7 +112,12 @@ BASE_FRAME = "base_link"
 CAMERA_FRAME = "camera_link"
 TCP_FRAME = "tool0"
 POTATO_CENTER = np.array([0.50, 0.00, 0.15])   # world == base_link here (robot at world origin)
-POTATO_SEED = None                             # None -> random potato shape each run
+# None -> a fresh random potato each run. Whichever seed is used is printed
+# at startup as `potato seed N`: `python -m potato_scan.sim_detection_check
+# --seed N` then rebuilds this exact potato (same draws, same vertices) with
+# no Isaac Sim, which is how a detection this scene cannot explain gets
+# checked against the geometry it was made on. Set it here to re-run one.
+POTATO_SEED = None
 CAMERA_TOPIC = "/camera/depth/color/points"
 TARGET_POSE_TOPIC = "/isaac_sim/cartesian_target"
 WRENCH_TOPIC = "/isaac_sim/drill_tip/wrench"
@@ -150,6 +156,15 @@ class IsaacSceneBridge(Node):
         It is answerable here, now, for free -- and unlike the callipers it
         also gives the true outward NORMAL, which is what the 84-degree
         failure of 2026-09-14 turned on.
+
+        "Where the pits actually are" was itself wrong until 2026-09-15:
+        the position came out as base_radius - eye_depth along the pit's
+        direction, ignoring the bumps, which put it a median 6mm inside
+        the surface and further than the 8mm matching tolerance for 37%
+        of eyes -- each of which then scored as a miss plus a spurious
+        detection no matter what the detector did. It is now the point
+        where the pit meets the real surface, bumps included (see
+        procedural_potato.generate).
         """
         msg = PoseArray()
         msg.header.frame_id = BASE_FRAME
@@ -227,8 +242,17 @@ def main():
     world.reset()  # initializes physics handles for the articulation
     robot.initialize()
 
-    _, eye_points, eye_normals = make_potato_mesh(
-        stage, "/World/potato", POTATO_CENTER, seed=POTATO_SEED)
+    potato = generate_potato_geometry(POTATO_CENTER, seed=POTATO_SEED)
+    make_potato_mesh(stage, "/World/potato", POTATO_CENTER, geometry=potato)
+    eye_points, eye_normals = potato.eye_points, potato.eye_normals
+    # The seed is what makes this potato reproducible off-line, and the
+    # bumps are the geometry the 2026-09-15 spurious detections were
+    # suspected of sitting on -- neither was visible anywhere before.
+    print(f"potato seed {potato.seed}: {len(eye_points)} eyes "
+          f"(depth {potato.eye_depth * 1000:.2f}mm, sigma {np.degrees(potato.eye_sigma):.1f}deg), "
+          f"{len(potato.bump_dirs)} bumps", flush=True)
+    for i, (bd, amp, w) in enumerate(zip(potato.bump_dirs, potato.bump_amp, potato.bump_width)):
+        print(f"  bump {i}: dir {np.round(bd, 3)} amp {amp * 1000:.1f}mm width {w:.2f}", flush=True)
 
     tool_prim = stage.GetPrimAtPath(TOOL_LINK_PRIM_PATH)
     if not tool_prim.IsValid():
