@@ -778,3 +778,26 @@ on effects this model omits, not on geometry.
   `normal_consistency` against `normal_vs_radial_deg`, then drilling), is
   what running the rest of "The next Isaac Sim session" order will show --
   not yet done as of this note.
+
+  **Update, same session, 67% coverage (40 raster views + partial
+  gap-filling):** 3/7 real eyes now found, position error down to 1.85mm
+  mean / 2.94mm worst (inside the 2mm bar), normal error 4.3deg mean /
+  9.4deg worst -- the fix holds up as more of the surface is scanned. But
+  **8 spurious detections appeared where there were 0 at 43-49% coverage**,
+  all high-confidence by the numbers that are supposed to separate a real
+  eye from noise (`normal_consistency` 0.88-0.997, `shape_index` 0.18-0.25 --
+  as cup-like as the real eyes). They cluster spatially (centroid ~34mm from
+  `potato_center`, ~20-30mm spread) on the side of the potato away from the
+  detected real eyes, rather than scattering evenly across the surface,
+  which points at a specific cause rather than generic noise: `bump_dirs`
+  (the mesh's 4-6 random low-frequency bumps, unrelated to the eye pits) can
+  leave a genuinely concave valley where two bumps meet, and raising mesh
+  resolution to resolve 2-15mm eye pits (this same fix) would have made
+  those valleys resolvable too, for the first time. **Not confirmed** --
+  `isaac_scene.py` doesn't currently expose `bump_dirs` to check candidate
+  positions against them directly -- but the spatial clustering argues
+  against plain sensor/reconstruction noise. If this holds up, the fix is
+  likely on the bump side (lower `bumpiness`, or keep bumps low-frequency
+  enough that adjacent ones can't create a sub-15mm concave valley) rather
+  than the eye side touched here. Worth confirming with `bump_dirs` logged
+  before spending time tuning `curvature_min`/`shape_index_max` against it.
