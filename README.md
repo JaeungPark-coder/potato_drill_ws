@@ -53,7 +53,7 @@ separates "my install is wrong" from "my hardware is wrong":
 ```bash
 cd src/potato_scan
 
-# 169 checks over the geometry, planning and detection maths. ~30 s.
+# 171 checks over the geometry, planning and detection maths. ~40 s.
 python -m pytest test/ -q
 
 # the fast subset, if you just want to know the install is sound. ~4 s.
@@ -64,8 +64,10 @@ python -m potato_scan.scan_budget --potatoes 5
 
 # the eye detector against the Isaac Sim potato -- the same geometry
 # isaac_scene.py builds, sampled at the accumulator's voxel size -- with no
-# Isaac Sim. --seed N rebuilds the exact potato a scene run printed at startup.
+# Isaac Sim. --seed N rebuilds the exact potato a scene run printed at startup;
+# --view-sweep cuts the cloud to what the raster orbit's first N views see
 python -m potato_scan.sim_detection_check --seeds 30
+python -m potato_scan.sim_detection_check --seeds 30 --view-sweep
 
 # is the camera even usable at the configured distance?
 python -c "
@@ -152,6 +154,22 @@ kappa collapsed to 35% / 2232. The kappa gate is still there behind
 which is the number to compare between the 43% and 67% runs. The next
 live run is the first with this gate; its report is not comparable to
 the numbers above, and reading it is now step 1's job.
+
+What to expect from it, from `sim_detection_check --view-sweep` (the
+raster orbit cut at N views, coverage from the robot's own grid, which
+lands where the live runs did -- 39% after 3 views, 73% after 10):
+
+| views | coverage | old gate found | new gate found | spurious (either) |
+|---|---|---|---|---|
+| 3 | ~39% | 10% | 14% | 0 |
+| 10 | ~73% | 15% | 30% | 0 |
+| 40 | ~100% | 32% | 56% | 0 |
+
+So 2/7 at 43-49% and 3/7 at 67% were the old gate doing what it does at
+that coverage. A full orbit under the new gate should land around 4/7 on
+an average potato with 0 spurious; the eyes still missing at 100% are the
+shallow-wide ones under the 150/m bar, and the H percentile log is where
+to see how far under.
 
 ### 0. Confirm the scene still starts
 
@@ -951,3 +969,17 @@ on effects this model omits, not on geometry.
   43%-vs-67% comparison actually needs), and on the synthetic test potato
   the shape index turned out to add nothing once H is signed -- kept as
   the saddle guard, at no cost. Not yet run live.
+
+  **Partial scans, same day.** `sim_detection_check --views N` /
+  `--view-sweep` cuts the sampled cloud to what the shipped raster orbit's
+  first N views reach (`procedural_potato.visible_from`: the same range,
+  field-of-view, grazing and self-occlusion tests `scan_budget` uses, with
+  occlusion against the analytic radius) and reports the coverage the
+  robot's own `SurfaceCoverageGrid` gives that cloud. The coverage column
+  reproduces the live runs' (39% after 3 views vs 43-49% live; 73% after
+  10 vs 82%), which makes the rows comparable, and under both gates
+  recall tracks coverage almost proportionally with 0 spurious at every
+  cut -- the ragged edge of a partial cloud, where a curvature fit is
+  least trustworthy, produced nothing. Still no sensor: no dropout in the
+  dark pocket an eye is, no specularity, no registration error between
+  views, so a live number below these is the camera's or the merge's.

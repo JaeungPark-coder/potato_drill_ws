@@ -254,3 +254,56 @@ def sample_surface(geometry, voxel_size=0.001, oversample=4.0, noise=0.0, rng=No
     if noise > 0.0:
         thinned = thinned + rng.normal(scale=noise, size=thinned.shape)
     return thinned
+
+
+def visible_from(geometry, points, camera_position, fov_deg=60.0, min_range=0.07,
+                 max_range=0.50, max_grazing_deg=70.0, occlusion_samples=12):
+    """Mask over `points`: which of them one view from `camera_position`
+    captures. The camera looks at the potato's centre.
+
+    The same four tests potato_surface.PotatoSurface.visible applies, for
+    the same reasons its docstring gives (range, field of view, grazing,
+    self-occlusion), on points sampled from THIS geometry instead of on
+    its own direction set -- and with the occlusion test against the
+    analytic radius rather than a nearest-sample lookup, since this
+    surface has one. Still no noise, dropout or specularity: what this
+    adds to sample_surface is only which patches a given orbit reaches,
+    which is what a partial scan's recall depends on.
+    """
+    points = np.asarray(points, dtype=float)
+    camera_position = np.asarray(camera_position, dtype=float)
+    to_camera = camera_position - points
+    distance = np.linalg.norm(to_camera, axis=1)
+    view_direction = to_camera / np.maximum(distance, 1e-12)[:, None]
+
+    in_range = (distance > min_range) & (distance < max_range)
+
+    optical_axis = geometry.center - camera_position
+    optical_axis = optical_axis / np.linalg.norm(optical_axis)
+    off_axis = np.arccos(np.clip((-view_direction) @ optical_axis, -1.0, 1.0))
+    in_fov = off_axis < np.radians(fov_deg) / 2.0
+
+    # grazing against the radial direction, which for a star-shaped
+    # surface stands in for the normal -- same stand-in PotatoSurface uses
+    radial = points - geometry.center
+    radial = radial / np.maximum(np.linalg.norm(radial, axis=1, keepdims=True), 1e-12)
+    grazing = np.arccos(np.clip(np.einsum('ij,ij->i', view_direction, radial), -1.0, 1.0))
+    facing = grazing < np.radians(max_grazing_deg)
+
+    candidate = in_range & in_fov & facing
+    if not np.any(candidate):
+        return candidate
+
+    starts = points[candidate] + view_direction[candidate] * 1e-3
+    steps = np.linspace(0.0, 1.0, occlusion_samples)[None, :, None]
+    samples = starts[:, None, :] + steps * (camera_position - starts)[:, None, :]
+
+    offsets = samples - geometry.center
+    sample_distance = np.linalg.norm(offsets, axis=2)
+    sample_directions = offsets / np.maximum(sample_distance, 1e-12)[..., None]
+    surface_here = geometry.radius_toward(sample_directions.reshape(-1, 3)).reshape(sample_distance.shape)
+
+    blocked = np.any(sample_distance < surface_here - 1e-4, axis=1)
+    result = candidate.copy()
+    result[np.flatnonzero(candidate)[blocked]] = False
+    return result

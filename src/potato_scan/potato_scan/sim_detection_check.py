@@ -13,15 +13,26 @@
     # the kappa gate the detector shipped with until 2026-09-16
     python -m potato_scan.sim_detection_check --seeds 30 --mean-curvature-min -1 --curvature-min 0.015
 
+    # a PARTIAL scan: only what the first N views of the shipped raster orbit
+    # can see (field of view, range, grazing, self-occlusion), with the
+    # coverage the robot's own grid would report for it
+    python -m potato_scan.sim_detection_check --seeds 30 --views 5
+    python -m potato_scan.sim_detection_check --seeds 30 --view-sweep
+
 The potato is procedural_potato.generate -- the identical geometry
 isaac_sim_common.make_potato_mesh wraps in USD -- sampled on its flat faces
 at pointcloud_accumulator's voxel size, plus Gaussian scanner noise. The
 detector is surface_curvature.find_eye_candidates with config/params.yaml's
 defaults, and the scoring is detection_accuracy.match_detections, the same
-code detection_accuracy_check runs live. What is missing is the camera:
-no grazing dropout, no occlusion, no multi-view registration error, every
-face seen once. So a candidate that shows up here is in the geometry, and
-one that shows up only in Isaac is in the camera or the merge.
+code detection_accuracy_check runs live. With `--views` the cloud is cut
+down to what the shipped raster orbit's first N views reach, by the same
+range / field-of-view / grazing / self-occlusion tests scan_budget uses,
+and scored alongside the coverage the robot's own SurfaceCoverageGrid
+reports for that cloud -- so a live run's "found X at Y% coverage" has an
+off-line counterpart. What is still missing is the sensor: no dropout in
+the dark pocket an eye is, no specularity, no registration error between
+views. A candidate that shows up here is in the geometry; one that shows
+up only in Isaac is in the camera or the merge.
 
 WHAT IT SETTLED, 2026-09-15 (30 potatoes, the kappa gate then in use)
 
@@ -71,13 +82,38 @@ spurious through 0.25mm. Both gates remain available here and in
 eye_detector, so this table can be re-run when a real camera's noise level
 is known -- which the `surface thickness` line, printed per potato, reads
 straight off a cloud.
+
+PARTIAL SCANS (`--view-sweep`, 30 potatoes, 0.15mm noise, H > 150/m)
+
+The live runs reported recall AT a coverage -- 2/7 at 43-49%, 3/7 at 67%
+-- and the question was always whether the missing eyes were unscanned or
+under the bar. This is the same raster orbit, cut at N views:
+
+    views   coverage   H > 150/m           kappa > 0.015 (old gate)
+    3       ~39%       14% found, 0 spur.  10%, 0
+    5       ~66%       19%, 0              11%, 0
+    10      ~73%       30%, 0              15%, 0
+    20      ~86%       39%, 0              21%, 0
+    40      ~100%      56%, 0              32%, 0
+
+The coverage column lands where the live runs did (43-49% after 3 views,
+82% after 10), so the rows are comparable: 2/7 at 43-49% and 3/7 at 67%
+are what the old gate does at that coverage, and finishing the orbit
+would have roughly doubled it, not found every eye. Recall tracks
+coverage almost proportionally under either gate -- the missing eyes at a
+partial coverage are mostly unscanned, and the ones missing at 100% are
+under the bar. The ragged edge of a partial cloud is where a curvature
+fit is least trustworthy, and the H gate produced no spurious candidates
+there at any cut.
 """
 import argparse
 
 import numpy as np
 
 from potato_scan.detection_accuracy import format_report, match_detections, summarize
-from potato_scan.procedural_potato import generate, sample_surface
+from potato_scan.procedural_potato import generate, sample_surface, visible_from
+from potato_scan.scan_schedule import RasterOrbitSchedule
+from potato_scan.surface_coverage import SurfaceCoverageGrid
 from potato_scan.surface_curvature import describe_surface, find_eye_candidates
 
 # config/params.yaml, eye_detector block -- kept as the one place the offline
@@ -87,17 +123,40 @@ DEFAULTS = dict(knn=30, mean_curvature_min=150.0, curvature_min=None, shape_inde
                 min_diameter=0.002, max_diameter=0.015, max_center_distance=0.07)
 POTATO_CENTER = np.array([0.50, 0.00, 0.15])
 VOXEL_SIZE = 0.001
+SCAN_RADIUS = 0.15   # scan_controller's scan_radius
+VIEW_SWEEP = (3, 5, 10, 20, 40)
 
 
-def detect(geometry, noise, params, voxel_size=VOXEL_SIZE, sample_seed=0):
+def partial_scan(geometry, points, n_views, scan_radius=SCAN_RADIUS):
+    """What the shipped raster orbit (45 x 25 degrees, 40 views, the
+    params.yaml defaults) sees in its first `n_views`, and the coverage the
+    robot's grid would report for it. Returns (mask, coverage_ratio)."""
+    schedule = RasterOrbitSchedule()
+    seen = np.zeros(len(points), dtype=bool)
+    for _ in range(min(int(n_views), len(schedule))):
+        _, _, direction = schedule.next_view()
+        seen |= visible_from(geometry, points, geometry.center + direction * scan_radius)
+    grid = SurfaceCoverageGrid()
+    grid.set_from_points(points[seen], geometry.center)
+    return seen, grid.coverage_ratio()
+
+
+def detect(geometry, noise, params, voxel_size=VOXEL_SIZE, sample_seed=0, views=None):
     points = sample_surface(geometry, voxel_size=voxel_size, noise=noise, rng=sample_seed)
+    coverage = None
+    if views is not None:
+        seen, coverage = partial_scan(geometry, points, views)
+        points = points[seen]
+    if len(points) < params['knn'] + 1:
+        empty = match_detections(np.empty((0, 3)), geometry.eye_points)
+        return points, None, [], empty, coverage
     surface = describe_surface(points, geometry.center, knn=params['knn'])
     candidates = find_eye_candidates(points, geometry.center, **params)
     result = match_detections(
         [c['position'] for c in candidates], geometry.eye_points,
         detected_normals=[c['normal'] for c in candidates],
         truth_normals=geometry.eye_normals)
-    return points, surface, candidates, result
+    return points, surface, candidates, result, coverage
 
 
 def _gate_label(params):
@@ -109,9 +168,13 @@ def _gate_label(params):
     return ' & '.join(parts) if parts else 'shape index only'
 
 
-def report_one(seed, noise, params, with_eyes=True):
+def report_one(seed, noise, params, with_eyes=True, views=None):
     geometry = generate(POTATO_CENTER, seed=seed, with_eyes=with_eyes)
-    points, surface, candidates, result = detect(geometry, noise, params)
+    points, surface, candidates, result, coverage = detect(geometry, noise, params, views=views)
+    if surface is None:
+        print(f'potato seed {geometry.seed}: {len(points)} points after {views} views -- '
+              f'too few to describe')
+        return result
     q = np.percentile(surface.kappa, [50, 90, 99])
     h = np.percentile(surface.mean_curvature, [50, 90, 99])
     thickness = np.percentile(surface.thickness, [50, 90])
@@ -119,7 +182,9 @@ def report_one(seed, noise, params, with_eyes=True):
     print(f'potato seed {geometry.seed}: {len(geometry.eye_dirs)} eyes '
           f'(depth {geometry.eye_depth * 1000:.2f}mm, sigma {np.degrees(geometry.eye_sigma):.1f}deg), '
           f'{len(geometry.bump_dirs)} bumps; {len(points)} points at {VOXEL_SIZE * 1000:.0f}mm '
-          f'+ {noise * 1000:.2f}mm noise')
+          f'+ {noise * 1000:.2f}mm noise'
+          + ('' if coverage is None else
+             f' | first {views} raster views, coverage {coverage * 100:.0f}%'))
     for i, (bd, amp, w) in enumerate(zip(geometry.bump_dirs, geometry.bump_amp, geometry.bump_width)):
         print(f'  bump {i}: dir {np.round(bd, 3)} amp {amp * 1000:.1f}mm width {w:.2f}')
     print(f'  gate: {_gate_label(params)}')
@@ -151,25 +216,29 @@ def report_one(seed, noise, params, with_eyes=True):
     return result
 
 
-def report_many(seeds, noise, params, with_eyes=True):
+def report_many(seeds, noise, params, with_eyes=True, views=None):
     found = truth = spurious = 0
-    positions, normals, kappa90 = [], [], []
+    positions, normals, kappa90, coverages = [], [], [], []
     for seed in seeds:
         geometry = generate(POTATO_CENTER, seed=seed, with_eyes=with_eyes)
-        _, surface, _, result = detect(geometry, noise, params)
-        kappa = surface.kappa
+        _, surface, _, result, coverage = detect(geometry, noise, params, views=views)
+        if coverage is not None:
+            coverages.append(coverage)
         s = summarize(result)
         found += s['found']
         truth += s['of']
         spurious += s['spurious']
         positions += [m[2] for m in result['matches']]
         normals += [m[3] for m in result['matches'] if m[3] is not None]
-        kappa90.append(np.percentile(kappa, 90))
+        if surface is not None:
+            kappa90.append(np.percentile(surface.kappa, 90))
 
     label = 'eyes carved' if with_eyes else 'eyes REMOVED (bumps only)'
-    line = (f'{len(seeds)} potatoes, {label}, {noise * 1000:.2f}mm noise, '
-            f'{_gate_label(params)}: kappa p90 ~{np.mean(kappa90):.4f} | '
-            f'found {found}/{truth}')
+    line = f'{len(seeds)} potatoes, {label}, {noise * 1000:.2f}mm noise, '
+    if views is not None:
+        line += f'first {views} views (coverage ~{np.mean(coverages) * 100:.0f}%), '
+    line += (f'{_gate_label(params)}: kappa p90 ~{np.mean(kappa90):.4f} | '
+             f'found {found}/{truth}')
     if truth:
         line += f' ({100.0 * found / truth:.0f}%)'
     line += f', spurious {spurious}'
@@ -192,6 +261,11 @@ def main(argv=None):
                         help='scanner noise, 1 sigma; the test suite uses 0.15')
     parser.add_argument('--no-eyes', action='store_true',
                         help='carve no pits: anything found is the bumps')
+    parser.add_argument('--views', type=int, default=None,
+                        help='keep only what the first N views of the shipped raster orbit '
+                             'see (default: the whole surface, no camera)')
+    parser.add_argument('--view-sweep', action='store_true',
+                        help=f'the summary line at each of {VIEW_SWEEP} views')
     parser.add_argument('--mean-curvature-min', type=float, default=DEFAULTS['mean_curvature_min'],
                         help='the H gate, 1/m; negative turns it off')
     parser.add_argument('--curvature-min', type=float, default=-1.0,
@@ -209,10 +283,13 @@ def main(argv=None):
     params['curvature_min'] = None if args.curvature_min < 0 else args.curvature_min
     noise = args.noise_mm / 1000.0
 
-    if args.seed is not None:
-        report_one(args.seed, noise, params, with_eyes=not args.no_eyes)
+    if args.view_sweep:
+        for views in VIEW_SWEEP:
+            report_many(range(args.seeds), noise, params, with_eyes=not args.no_eyes, views=views)
+    elif args.seed is not None:
+        report_one(args.seed, noise, params, with_eyes=not args.no_eyes, views=args.views)
     else:
-        report_many(range(args.seeds), noise, params, with_eyes=not args.no_eyes)
+        report_many(range(args.seeds), noise, params, with_eyes=not args.no_eyes, views=args.views)
 
 
 if __name__ == '__main__':

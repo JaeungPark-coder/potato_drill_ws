@@ -9,7 +9,7 @@ from scipy.spatial import cKDTree
 
 from potato_scan.detection_accuracy import match_detections
 from potato_scan.procedural_potato import (
-    EYE_DEPTH_M, EYE_SIGMA_RAD, generate, sample_surface)
+    EYE_DEPTH_M, EYE_SIGMA_RAD, generate, sample_surface, visible_from)
 from potato_scan.surface_curvature import find_eye_candidates
 from potato_scan import sim_detection_check
 
@@ -149,6 +149,27 @@ def test_bump_edge_offset_is_zero_on_the_rim():
     assert index[0] == 0
 
 
+def test_a_view_sees_the_near_side_and_not_the_far_side():
+    geometry = generate(CENTER, seed=3)
+    surface = sample_surface(geometry, rng=3)
+    camera = CENTER + np.array([0.15, 0.0, 0.0])
+    seen = visible_from(geometry, surface, camera)
+    toward_camera = (surface - CENTER)[:, 0] > 0.02
+    away = (surface - CENTER)[:, 0] < -0.02
+    # not all of it: grazing and the bumps' own shadows take their share
+    assert seen[toward_camera].mean() > 0.5
+    assert not seen[away].any()
+
+
+def test_the_full_raster_covers_the_grid_and_partial_cuts_grow_monotonically():
+    geometry = generate(CENTER, seed=4)
+    surface = sample_surface(geometry, rng=4)
+    coverages = [sim_detection_check.partial_scan(geometry, surface, n)[1] for n in (1, 3, 10, 40)]
+    assert all(b >= a for a, b in zip(coverages, coverages[1:])), coverages
+    assert coverages[0] < 0.3
+    assert coverages[-1] > 0.95
+
+
 # --- 4. what the detector does with it ------------------------------------
 
 @pytest.mark.slow
@@ -205,7 +226,9 @@ def test_the_mean_curvature_gate_survives_the_noise_that_breaks_kappa():
 def test_the_check_tool_runs_both_ways(capsys):
     sim_detection_check.main(['--seeds', '2'])
     sim_detection_check.main(['--seed', '0'])
+    sim_detection_check.main(['--seeds', '2', '--views', '3'])
     out = capsys.readouterr().out
     assert '2 potatoes' in out
     assert 'potato seed 0' in out
+    assert 'first 3 views (coverage' in out
     assert 'detection accuracy vs ground truth' in out
