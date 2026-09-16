@@ -249,9 +249,10 @@ class EyeDetector(Node):
         fields = ('x', 'y', 'z', 'rgb') if has_rgb else ('x', 'y', 'z')
         # read_points returns a STRUCTURED array (named dtype fields), not a
         # plain (N, len(fields)) float array -- see pointcloud_accumulator.py's
-        # matching fix/comment (2026-09-14).
-        raw = np.array(list(pc2.read_points(
-            cloud_msg, field_names=fields, skip_nans=True)))
+        # matching fix/comment (2026-09-14). It also already returns that
+        # array directly, so wrapping it in list(...) (found 2026-09-16) was
+        # a wasted round trip through Python tuples, same fix as that file's.
+        raw = pc2.read_points(cloud_msg, field_names=fields, skip_nans=True)
         if len(raw) < self.knn + 1:
             self.get_logger().warn('not enough points for eye detection')
             return

@@ -192,7 +192,7 @@ class IsaacSimRobotInterface:
         insertion_axis = base_rot_matrix[:, axis_index]  # +Z: into the surface
 
         travel = 0.0
-        contact_travel = None
+        contact_position = None  # ACTUAL measured TCP position at first contact, not commanded travel
         depth = 0.0
         peak_force = 0.0
         status = 'timeout'
@@ -207,15 +207,30 @@ class IsaacSimRobotInterface:
             if force_mag is not None:
                 peak_force = max(peak_force, force_mag)
 
-            if contact_travel is None:
+            # CONFIRMED risk 2026-09-16, not yet seen in the field: depth
+            # used to be `travel - contact_travel`, the COMMANDED cumulative
+            # step count, not where the tool actually is. Against a rigid
+            # static collider (this scene's potato, MeshCollisionAPI
+            # approximation="none"), commanding the target further into
+            # solid geometry than the arm can actually track would have
+            # reported that commanded distance as depth regardless of
+            # whether the tip really moved -- indistinguishable in the log
+            # from a real insertion. Reading the actual TCP position from TF
+            # (get_tcp_pose(), the same source drill_controller already
+            # trusts for start_pos) makes depth measure what happened, not
+            # what was asked for.
+            actual_pos, _ = self.get_tcp_pose()
+
+            if contact_position is None:
                 if force_mag is not None and force_mag >= contact_force:
-                    contact_travel = travel
+                    contact_position = actual_pos if actual_pos is not None else target_pos
                 elif travel >= max_approach_travel:
                     status = 'no_contact'
                     break
 
-            if contact_travel is not None:
-                depth = travel - contact_travel
+            if contact_position is not None:
+                depth = (float(np.dot(actual_pos - contact_position, insertion_axis))
+                         if actual_pos is not None else 0.0)
                 if depth >= max_depth:
                     status = 'reached'
                     break
@@ -224,7 +239,7 @@ class IsaacSimRobotInterface:
                     break
 
         return DrillOutcome(status=status, depth_m=depth, peak_force_n=peak_force,
-                            contacted=contact_travel is not None)
+                            contacted=contact_position is not None)
 
     def stop(self):
         pass  # no in-flight trajectory queue to cancel with a pose-target interface

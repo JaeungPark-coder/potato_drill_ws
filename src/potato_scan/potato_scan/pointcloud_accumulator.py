@@ -26,6 +26,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import PointStamped
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2 as pc2
 from std_msgs.msg import Header, Int32
@@ -66,6 +67,26 @@ class PointCloudAccumulator(Node):
         self.declare_parameter('camera_topic', '/camera/depth/color/points')
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('voxel_size', 0.001)  # 1mm, potato-scale detail
+        # Fallback only -- updated from scan_controller's own accepted fit
+        # over /potato_scan/potato_center, same pattern eye_detector uses.
+        self.declare_parameter('potato_center', [0.5, 0.0, 0.15])
+        # No ROI crop here at all, before 2026-09-16, meant every frame's
+        # points -- table, fixture, the ROBOT'S OWN BASE -- merged in
+        # permanently: CONFIRMED against a real scan that this is exactly
+        # how points on the robot base ended up read as candidate eyes
+        # (eye_detector.py's own max_center_distance fix works around the
+        # symptom; this is the point it should never have reached at all),
+        # and why a 4-view partial scan already merged to 2.35M points with
+        # a bounding box spanning tens of metres. Cropping here means every
+        # downstream consumer (scan_controller's coverage estimate,
+        # eye_detector's curvature computation) only ever sees points that
+        # could plausibly be the potato, and the merged cloud stops growing
+        # without bound as more of the irrelevant scene comes into view.
+        # Generous on purpose relative to eye_detector's own
+        # max_expected_radius (0.07m): this crop has to keep the whole
+        # potato AND enough surrounding context (fixture, pin) for
+        # scan_controller's reachability/fixture checks, not just eyes.
+        self.declare_parameter('roi_radius_m', 0.20)
         # Statistical outlier removal on each incoming frame. A point is
         # dropped when its mean distance to its `outlier_neighbors` nearest
         # neighbours is more than `outlier_std_ratio` standard deviations
@@ -75,6 +96,8 @@ class PointCloudAccumulator(Node):
 
         self.base_frame = self.get_parameter('base_frame').value
         self.voxel_size = self.get_parameter('voxel_size').value
+        self.potato_center = np.array(self.get_parameter('potato_center').value, dtype=float)
+        self.roi_radius_m = self.get_parameter('roi_radius_m').value
         self.outlier_neighbors = self.get_parameter('outlier_neighbors').value
         self.outlier_std_ratio = self.get_parameter('outlier_std_ratio').value
         camera_topic = self.get_parameter('camera_topic').value
@@ -85,6 +108,8 @@ class PointCloudAccumulator(Node):
         qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT,
                           history=HistoryPolicy.KEEP_LAST)
         self.sub = self.create_subscription(PointCloud2, camera_topic, self.on_cloud, qos)
+        self.create_subscription(
+            PointStamped, '/potato_scan/potato_center', self._on_potato_center, 10)
         self.cloud_pub = self.create_publisher(PointCloud2, '/potato_scan/merged_cloud', 10)
         self.count_pub = self.create_publisher(Int32, '/potato_scan/point_count', 10)
 
@@ -92,6 +117,9 @@ class PointCloudAccumulator(Node):
         self._warned_no_rgb = False
 
         self.create_timer(1.0, self.publish_status)
+
+    def _on_potato_center(self, msg):
+        self.potato_center = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=float)
 
     def on_cloud(self, msg: PointCloud2):
         try:
@@ -111,7 +139,14 @@ class PointCloudAccumulator(Node):
         # so this had never actually been run against a real PointCloud2
         # message before. Indexed by field name instead, which works
         # regardless of the array's dtype layout.
-        raw = np.array(list(pc2.read_points(msg, field_names=fields, skip_nans=True)))
+        #
+        # read_points already RETURNS that structured ndarray directly (see
+        # its own type hint) -- wrapping it in list(...) here, found
+        # 2026-09-16, iterated the whole thing into a list of Python
+        # structured-scalar tuples and then rebuilt an array from that, a
+        # pure-Python round trip over every point in the cloud for no
+        # benefit. Fixed by using the return value as-is.
+        raw = pc2.read_points(msg, field_names=fields, skip_nans=True)
         if raw.size == 0:
             return
         points = np.column_stack([raw['x'], raw['y'], raw['z']])
@@ -126,6 +161,18 @@ class PointCloudAccumulator(Node):
         mat = transform_to_matrix(tf)
         pts_h = np.hstack([points, np.ones((points.shape[0], 1))])
         pts_base = (mat @ pts_h.T).T[:, :3]
+
+        # ROI crop, in base_frame so it means the same physical region
+        # regardless of where the eye-in-hand camera is looking from. See
+        # roi_radius_m's own declare_parameter comment for why this exists:
+        # without it, the table/fixture/robot base merge in permanently and
+        # never leave.
+        in_roi = np.linalg.norm(pts_base - self.potato_center, axis=1) <= self.roi_radius_m
+        pts_base = pts_base[in_roi]
+        if colors is not None:
+            colors = colors[in_roi]
+        if len(pts_base) == 0:
+            return
 
         cloud = o3d.geometry.PointCloud()
         cloud.points = o3d.utility.Vector3dVector(pts_base)

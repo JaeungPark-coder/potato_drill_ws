@@ -96,6 +96,21 @@ pointcloud_accumulator:
     camera_topic: "/camera/depth/color/points"
     base_frame: "base_link"
     voxel_size: 0.001
+    # Fallback only -- updated live from scan_controller's own accepted fit
+    # over /potato_scan/potato_center, same pattern eye_detector uses.
+    potato_center: [0.50, 0.00, 0.15]
+    # ROI crop radius, in base_frame, around potato_center. Added 2026-09-16:
+    # with no crop at all, every frame's points -- table, fixture, the
+    # ROBOT'S OWN BASE -- merged in permanently, which is how points on the
+    # robot base ended up read as candidate eyes downstream (eye_detector's
+    # own max_center_distance is a workaround for the symptom; this is the
+    # point it should never have reached at all) and why a 4-view partial
+    # scan already merged to 2.35M points with a bounding box spanning tens
+    # of metres. Generous relative to eye_detector's own max_expected_radius
+    # (0.07m): this crop has to keep the whole potato AND enough surrounding
+    # context (fixture, pin) for scan_controller's own reachability/fixture
+    # checks, not just eyes.
+    roi_radius_m: 0.20
     # Statistical outlier removal, applied per incoming frame before the
     # merge. Stereo depth invents "flying pixels" along the potato's
     # silhouette; left in, they count as covered surface in

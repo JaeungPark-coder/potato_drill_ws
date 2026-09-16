@@ -161,6 +161,18 @@ class DrillController(Node):
                 drill_output_pin=self.get_parameter('drill_output_pin').value)
 
         self._eyes = None  # list of (position, normal)
+        # CONFIRMED risk 2026-09-16, not yet seen in the field: _on_start is
+        # on the reentrant _cb_group deliberately (see that group's own
+        # comment -- run_drilling's move_to_pose/force_drill need to keep
+        # polling TF/the wrench topic while blocked), which also means a
+        # SECOND start_drilling message arriving while run_drilling is still
+        # going would enter _on_start again and run a second run_drilling
+        # concurrently with the first -- two overlapping visits to the same
+        # eyes, driving the arm from two places at once. This flag is
+        # narrower than switching the group (which would break the
+        # concurrency run_drilling actually needs): it only refuses a
+        # second start while one is already in progress.
+        self._drilling_in_progress = False
         self.create_subscription(
             PoseArray, '/potato_scan/eye_poses', self._on_eye_poses, 10, callback_group=self._cb_group)
         self.create_subscription(
@@ -193,7 +205,16 @@ class DrillController(Node):
         if not self._eyes:
             self.get_logger().warn('start_drilling received but no eye poses available')
             return
-        self.run_drilling()
+        if self._drilling_in_progress:
+            self.get_logger().warn(
+                'start_drilling received while a drilling pass is already in progress -- '
+                'ignoring it rather than running a second pass concurrently with the first')
+            return
+        self._drilling_in_progress = True
+        try:
+            self.run_drilling()
+        finally:
+            self._drilling_in_progress = False
 
     def _find_reachable_approach(self, position, normal):
         """Try the default approach orientation, then sweep roll about the
@@ -360,28 +381,36 @@ class DrillController(Node):
 
             task_frame = list(approach) + list(rotvec)
             self.robot.drill_on()
-            with metrics.timer('drill'):
-                outcome = self.robot.force_drill(
-                    task_frame, axis_index=2,
-                    feed_force=self.feed_force, max_force=self.max_force,
-                    max_depth=self.max_depth, timeout_s=self.drill_timeout_s,
-                    contact_force=self.contact_force,
-                    max_approach_travel=self.max_approach_travel)
-            self._report_outcome(idx, outcome)
-            attempts.append(EyeAttempt(
-                index=idx, status=outcome.status, depth_m=outcome.depth_m,
-                peak_force_n=outcome.peak_force_n, tilt_deg=tilt_deg, roll_deg=roll_deg))
+            try:
+                with metrics.timer('drill'):
+                    outcome = self.robot.force_drill(
+                        task_frame, axis_index=2,
+                        feed_force=self.feed_force, max_force=self.max_force,
+                        max_depth=self.max_depth, timeout_s=self.drill_timeout_s,
+                        contact_force=self.contact_force,
+                        max_approach_travel=self.max_approach_travel)
+                self._report_outcome(idx, outcome)
+                attempts.append(EyeAttempt(
+                    index=idx, status=outcome.status, depth_m=outcome.depth_m,
+                    peak_force_n=outcome.peak_force_n, tilt_deg=tilt_deg, roll_deg=roll_deg))
 
-            if self.cut_lateral_radius > 0.0 and outcome.contacted:
-                with metrics.timer('widen'):
-                    followed, on_force = self._widening_pass(rotvec, outcome.depth_m)
-                self.get_logger().info(
-                    f'eye {idx}: widening pass followed {followed} waypoints'
-                    + (' (stopped on force)' if on_force else ''))
+                if self.cut_lateral_radius > 0.0 and outcome.contacted:
+                    with metrics.timer('widen'):
+                        followed, on_force = self._widening_pass(rotvec, outcome.depth_m)
+                    self.get_logger().info(
+                        f'eye {idx}: widening pass followed {followed} waypoints'
+                        + (' (stopped on force)' if on_force else ''))
 
-            with metrics.timer('retract'):
-                self.robot.move_to_pose(approach, rotvec)  # clear the surface
-            self.robot.drill_off()
+                with metrics.timer('retract'):
+                    self.robot.move_to_pose(approach, rotvec)  # clear the surface
+            finally:
+                # CONFIRMED risk 2026-09-16, not yet seen in the field: this
+                # used to be a plain call after retract, so an exception
+                # anywhere from drill_on() to here (force_drill, the
+                # widening pass, or the retract move) skipped it entirely,
+                # leaving the drill motor energized with no code path left
+                # to turn it off.
+                self.robot.drill_off()
 
         self.get_logger().info('drilling pass complete')
         self.get_logger().info(format_attempt_table(attempts))

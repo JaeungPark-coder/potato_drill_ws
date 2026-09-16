@@ -298,7 +298,12 @@ class ScanController(Node):
         # matching fix/comment (2026-09-14) for how this was confirmed
         # against a real PointCloud2 message. estimate_center/set_from_points
         # both need a plain float array to do arithmetic on.
-        raw = np.array(list(pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)))
+        #
+        # read_points already returns that structured array directly --
+        # list(...) here (found 2026-09-16, same fix as
+        # pointcloud_accumulator.py) iterated it into Python tuples and
+        # rebuilt an array from those for no benefit.
+        raw = pc2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
         pts = np.column_stack([raw['x'], raw['y'], raw['z']]) if raw.size else raw.reshape(0, 3)
         if self.auto_center:
             self._update_potato_center(pts)
