@@ -171,6 +171,55 @@ an average potato with 0 spurious; the eyes still missing at 100% are the
 shallow-wide ones under the 150/m bar, and the H percentile log is where
 to see how far under.
 
+**2026-09-16, separately, four narrower fixes landed alongside the gate
+change above -- none of them run live yet, so the next run is the first
+evidence for any of them:**
+
+- `pointcloud_accumulator` had no region-of-interest crop at all -- every
+  frame's points (table, fixture, the robot's own base) merged in
+  permanently, which is the likely explanation for why points on the
+  robot base were showing up as candidate eyes downstream, and why a
+  4-view partial scan once merged to 2.35M points with a bounding box
+  spanning tens of metres. Added `roi_radius_m` (0.20m, config/params.yaml),
+  applied in `base_frame` and centred on `scan_controller`'s own accepted
+  `potato_center` fit. **Watch for**: the crop is generous relative to
+  `eye_detector`'s own 0.07m `max_expected_radius` on purpose (it also has
+  to keep fixture context for `scan_controller`'s reachability checks) --
+  if the next run's coverage/centre estimate looks worse than the 2026-09-14
+  baseline, this radius is the first thing to widen, not the gate.
+- `pointcloud_accumulator.py`/`scan_controller.py`/`eye_detector.py` all
+  wrapped `pc2.read_points(...)` in `list(...)` before use, even though
+  `read_points` already returns the structured array directly -- a pure
+  Python round-trip over every point in every cloud for no benefit.
+  Dropped. Performance-only; nothing to verify beyond "still runs".
+- `drill_controller._on_start` had no guard against a second
+  `start_drilling` message arriving while `run_drilling` was still in
+  progress -- it's deliberately on a reentrant callback group (the polling
+  inside `run_drilling` needs that), so nothing stopped two passes running
+  concurrently against the same robot. Added an in-progress flag rather
+  than changing the group. Also wrapped each eye's `drill_on()`/
+  `force_drill()`/retract in `try/finally: drill_off()` -- previously a
+  plain call after retract, so any exception in between left the drill
+  motor energized with no remaining code path to turn it off. **Watch
+  for**: this has never been exercised against a real double-publish or a
+  mid-drill exception; step 3 below is the first chance to.
+- `isaac_robot_interface.force_drill` measured insertion depth from the
+  COMMANDED cumulative travel, not the tool's actual measured position --
+  against this scene's rigid static potato collider
+  (`MeshCollisionAPI approximation="none"`), commanding the target further
+  into solid geometry than the arm can actually track would have reported
+  that commanded distance as depth regardless of whether the tip really
+  moved. Now reads `get_tcp_pose()` (the same source `drill_controller`
+  already trusts for `start_pos`) each poll instead. **Watch for**: this
+  changes what `DrillOutcome.depth_m` means for every future run -- if
+  step 3's drilling numbers look different from any older log lying
+  around, this is why, not a regression.
+
+None of these four touch the gate/coverage numbers in the table above --
+they were found and fixed reading the code and the ROS2 message contracts,
+not from a run that exposed them live. Treat them as "should be strictly
+better," not yet "confirmed better."
+
 ### 0. Confirm the scene still starts
 
 `isaac_scene.py` imports `potato_scan.drill_task_planner` for the one
