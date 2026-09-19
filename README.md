@@ -319,6 +319,66 @@ search, not a hang.
 A `reached` outcome on one eye is the first real evidence the whole chain
 works. Everything before this point has been verified; this has not.
 
+### 4. Planned, not yet built: an RGB-based detection branch to break the recall ceiling
+
+**2026-09-19, planning only -- nothing below this point is implemented.**
+The mean-curvature gate (step above) separates eyes from body by 3-10x and
+still recalls only ~56% at full coverage (4/7 on average) -- the README's
+own reading of why is that shallow, wide eyes sit under the 150/m bar
+*geometrically*, and lowering the bar to catch them re-admits noise-floor
+false positives (2232 spurious on the same 30 potatoes at the kappa gate's
+equivalent threshold). That is a ceiling on shape-only detection, not a
+tuning problem: potato eyes are as much a colour/texture cue (the eye's
+rim and pit typically shows different pigmentation than the surrounding
+skin) as a shape one, and nothing in this pipeline currently looks at
+colour for detection -- `eye_detector.py` works entirely from
+`describe_surface`'s curvature/shape-index fit over XYZ.
+
+**Why this isn't a small tweak to the existing detector, and needs its own
+branch instead:** it's a different sensing modality (learned RGB features,
+not analytic geometry), so it plugs in as a second, independent detector
+whose candidates are fused with the geometric one, not a new threshold on
+the existing code path.
+
+Proposed architecture (consensus, not replacement):
+1. **Prerequisite, currently missing**: `isaac_scene.py`'s point cloud
+   publisher (`isaac/isaac_scene.py`, ~line 304) uses Replicator's
+   `pointcloud` annotator and `pc2.create_cloud_xyz32` -- XYZ only, no
+   colour, confirmed by reading the file. `pointcloud_accumulator.py` and
+   `eye_detector.py` already have an RGB code path (`cloud_rgb.py`'s
+   `pack_rgb`/`unpack_rgb`, and the `has_rgb` branch that currently always
+   takes the "no rgb field" warning branch against this sim) -- so half of
+   this is already built and simply has nothing to consume. Adding an
+   `rgb` annotator alongside the existing `pointcloud` one in
+   `isaac_scene.py`, the same way `vla_ur5e_ws/isaac/pick_place_scene.py`
+   already attaches two annotators to one render product, is the first
+   piece of actual implementation work here.
+2. Fine-tune a detection model (YOLOv7/YOLOv10m -- accuracy over
+   real-time, since this is a discrete per-view pipeline, not a video
+   feed) on a public potato-eye dataset with bounding boxes
+   (`github.com/divyanthlg/tissueSamplingRobot`, 5 cultivars, ~900 images
+   -- labeling cost is close to zero since this already exists).
+3. Per view: run the detector on the RGB frame, back-project each
+   detected box's centre to 3D using the 3-5 valid depth samples inside
+   it, inverse-distance weighted (matches how this pipeline already
+   estimates centres elsewhere, e.g. `surface_coverage.estimate_center`).
+4. Fuse across views: DBSCAN (eps 3mm, min_samples 3) on the RGB
+   detector's 3D points in `base_frame`, the same frame
+   `pointcloud_accumulator` already accumulates into.
+5. Consensus: an eye flagged by both the RGB and geometric detectors is
+   high-confidence; either alone is medium-confidence. The geometric
+   detector's normal estimate is still what `drill_controller` needs for
+   approach direction regardless of which detector found the eye, so it
+   stays in the loop as a cross-check, not a fallback.
+
+**Not started**: no annotator change, no model fine-tuning, no fusion
+code. This is here so the next session (or a different contributor) does
+not have to re-derive the plan from the recall numbers again -- see the
+mean-curvature gate table above for the exact ceiling this is meant to
+break through, and re-measure against the same 30 simulated potatoes
+(`sim_detection_check`) once this exists, so the 56%-vs-with-RGB
+comparison is apples to apples.
+
 
 ## Running against Isaac Sim instead of real hardware
 
